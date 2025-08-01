@@ -5,43 +5,51 @@ import { useMemo, useRef } from 'react'
 import { useControls } from 'leva'
 
 // ---------- Simulation constants ----------
-const N           = 32               // number of mass-points
-const RADIUS      = 0.20             // rest ring radius
-const K_SPRING    = 40.0             // perimeter spring stiffness
-const DAMPING     = 2.0              // global damping
-const AREA_REST   = Math.PI * RADIUS * RADIUS
-const PRESSURE_K  = 80.0             // internal gas pressure
-const WALL_K      = 300.0            // wall spring
-const WALL_DAMP   = 5.0              // wall damping
-const SHAPE_K     = 60.0             // shape-matching stiffness
-const GRAVITY     = new THREE.Vector2(0, -5)
+const GRAVITY_Y   = -5               // default gravity Y value
 
 // ---------- Helper: generate rest positions on a circle ----------
-const genRest = () => [...Array(N)].map((_, i) => {
-  const a = (i / N) * Math.PI * 2
-  return [RADIUS * Math.cos(a), RADIUS * Math.sin(a)]
+const genRest = (n, r) => [...Array(n)].map((_, i) => {
+  const a = (i / n) * Math.PI * 2
+  return [r * Math.cos(a), r * Math.sin(a)]
 })
 
 export default function SoftBody () {
 
   const { gl, viewport } = useThree()
-  const restPos          = useMemo(genRest, [])
-  const { kShape, pressureK } = useControls({
-    kShape   : { value: SHAPE_K, min: 0, max: 200, step: 1 },
-    pressureK: { value: PRESSURE_K, min: 0, max: 200, step: 1 }
+  const { 
+    kShape, 
+    pressureK, 
+    kSpring, 
+    damping, 
+    wallK, 
+    wallDamp, 
+    gravityY,
+    radius,
+    numPoints
+  } = useControls({
+    kShape   : { value: 60, min: 0, max: 200, step: 1 },
+    pressureK: { value: 80, min: 0, max: 200, step: 1 },
+    kSpring  : { value: 40, min: 0, max: 100, step: 1 },
+    damping  : { value: 2, min: 0, max: 10, step: 0.1 },
+    wallK    : { value: 300, min: 0, max: 500, step: 10 },
+    wallDamp : { value: 5, min: 0, max: 20, step: 0.5 },
+    gravityY : { value: GRAVITY_Y, min: -20, max: 0, step: 0.5 },
+    radius   : { value: 0.2, min: 0.05, max: 0.5, step: 0.01 },
+    numPoints: { value: 32, min: 16, max: 64, step: 8 }
   })
+  const restPos          = useMemo(() => genRest(numPoints, radius), [numPoints, radius])
 
-  /* ---------- GPUComputationRenderer init (once) ---------- */
+  /* ---------- GPUComputationRenderer init (reactive) ---------- */
   const { gpu, posVar } = useMemo(() => {
 
     // -- 1. create GPUCompute instance & seed texture --
-    const gpu = new GPUComputationRenderer(N, 1, gl)
+    const gpu = new GPUComputationRenderer(numPoints, 1, gl)
     const tex = gpu.createTexture()
-    for (let i = 0; i < N; i++) {
-      const a = (i / N) * 2 * Math.PI
+    for (let i = 0; i < numPoints; i++) {
+      const a = (i / numPoints) * 2 * Math.PI
       tex.image.data.set([
-        RADIUS * Math.cos(a),        // x
-        RADIUS * Math.sin(a),        // y
+        radius * Math.cos(a),        // x
+        radius * Math.sin(a),        // y
         0,                           // vx
         0                            // vy
       ], i * 4)
@@ -64,8 +72,8 @@ export default function SoftBody () {
       uniform vec2   trans;      // translation
       uniform float  kShape;
 
-      const int   I_N = ${N};
-      const float F_N = float(${N});
+      const int   I_N = ${numPoints};
+      const float F_N = float(${numPoints});
       const vec2  qRest[I_N] = vec2[](${restGLSL});
 
       // ------- helpers -------
@@ -163,29 +171,29 @@ export default function SoftBody () {
 
     Object.assign(posVar.material.uniforms, {
       dt         : { value: 0 },
-      kSpring    : { value: K_SPRING },
-      damping    : { value: DAMPING },
-      restLen    : { value: (2*Math.PI*RADIUS)/N },
-      areaRest   : { value: AREA_REST },
-      kPressure  : { value: PRESSURE_K },
-      gravity    : { value: GRAVITY },
-      wallK      : { value: WALL_K },
-      wallDamp   : { value: WALL_DAMP },
+      kSpring    : { value: kSpring },
+      damping    : { value: damping },
+      restLen    : { value: (2*Math.PI*radius)/numPoints },
+      areaRest   : { value: Math.PI * radius * radius },
+      kPressure  : { value: pressureK },
+      gravity    : { value: new THREE.Vector2(0, gravityY) },
+      wallK      : { value: wallK },
+      wallDamp   : { value: wallDamp },
       rot        : { value: new THREE.Vector2(1,0) }, // cos, sin
       trans      : { value: new THREE.Vector2() },
-      kShape     : { value: SHAPE_K }
+      kShape     : { value: kShape }
     })
 
     // -- 5. compile & return --
     const err = gpu.init()
     if (err) console.error(err)
     return { gpu, posVar }
-  }, [gl, restPos])
+  }, [gl, restPos, numPoints, radius])
 
   /* ---------- instanced circles ---------- */
   const instRef = useRef()
   const dummy   = useMemo(() => new THREE.Object3D(), [])
-  const buf     = useMemo(() => new Float32Array(N * 4), [])
+  const buf     = useMemo(() => new Float32Array(numPoints * 4), [numPoints])
 
   /* ---------- per-frame update ---------- */
   useFrame((_, dt) => {
@@ -193,18 +201,25 @@ export default function SoftBody () {
     posVar.material.uniforms.dt.value       = dt
     posVar.material.uniforms.kPressure.value= pressureK
     posVar.material.uniforms.kShape.value   = kShape
+    posVar.material.uniforms.kSpring.value  = kSpring
+    posVar.material.uniforms.damping.value  = damping
+    posVar.material.uniforms.wallK.value    = wallK
+    posVar.material.uniforms.wallDamp.value = wallDamp
+    posVar.material.uniforms.gravity.value  = new THREE.Vector2(0, gravityY)
+    posVar.material.uniforms.restLen.value  = (2*Math.PI*radius)/numPoints
+    posVar.material.uniforms.areaRest.value = Math.PI * radius * radius
     gpu.compute()
 
-    // 2. read positions back (32 points → negligible)
+    // 2. read positions back (numPoints → negligible)
     const rt = gpu.getCurrentRenderTarget(posVar)
-    gl.readRenderTargetPixels(rt, 0, 0, N, 1, buf)
+    gl.readRenderTargetPixels(rt, 0, 0, numPoints, 1, buf)
 
     // 3. compute centroid & covariance (for shape matching)
     let cx=0, cy=0
-    for (let i=0;i<N;i++){ cx+=buf[4*i]; cy+=buf[4*i+1] }
-    cx/=N; cy/=N
+    for (let i=0;i<numPoints;i++){ cx+=buf[4*i]; cy+=buf[4*i+1] }
+    cx/=numPoints; cy/=numPoints
     let a=0,b=0
-    for (let i=0;i<N;i++){
+    for (let i=0;i<numPoints;i++){
       const px = buf[4*i]   - cx
       const py = buf[4*i+1] - cy
       const q  = restPos[i]
@@ -218,7 +233,7 @@ export default function SoftBody () {
     posVar.material.uniforms.trans.value.set(cx, cy) // rest centroid is (0,0)
 
     // 4. update instanced mesh transforms
-    for (let i=0;i<N;i++){
+    for (let i=0;i<numPoints;i++){
       dummy.position.set(buf[4*i], buf[4*i+1], 0)
       dummy.updateMatrix()
       instRef.current.setMatrixAt(i, dummy.matrix)
@@ -228,7 +243,7 @@ export default function SoftBody () {
 
   /* ---------- JSX ---------- */
   return (
-    <instancedMesh ref={instRef} args={[null, null, N]}>
+    <instancedMesh ref={instRef} args={[null, null, numPoints]}>
       <circleGeometry args={[0.01, 16]} />
       <meshBasicMaterial color="#ff4040" />
     </instancedMesh>
