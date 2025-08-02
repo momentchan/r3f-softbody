@@ -2,7 +2,7 @@ import * as THREE from 'three'
 import { useFrame, useThree } from '@react-three/fiber'
 import { GPUComputationRenderer } from 'three/examples/jsm/Addons.js'
 import { useMemo, useRef, useState } from 'react'
-import { useControls } from 'leva'
+import { useControls, folder } from 'leva'
 import SoftBodyRender from './SoftBodyRender'
 
 // ---------- Helper: generate rest positions on a circle ----------
@@ -14,17 +14,19 @@ const genRest = (n, r) => [...Array(n)].map((_, i) => {
 // ---------- Custom Hook: Soft Body Configuration ----------
 const useSoftBodyConfig = () => {
   return useControls({
-    debugPoints: { value: true },
-    kShape: { value: 300, min: 0, max: 1000, step: 1 },
-    pressureK: { value: 80, min: 0, max: 200, step: 1 },
-    kSpring: { value: 40, min: 0, max: 100, step: 1 },
-    damping: { value: 2, min: 0, max: 10, step: 0.1 },
-    wallK: { value: 300, min: 0, max: 500, step: 10 },
-    wallDamp: { value: 5, min: 0, max: 20, step: 0.5 },
-    gravityY: { value: -5, min: -20, max: 0, step: 0.5 },
-    radius: { value: 0.2, min: 0.05, max: 0.5, step: 0.01 },
-    numPoints: { value: 64, min: 16, max: 64, step: 8 },
-    wallDistance: { value: 0.9, min: 0, max: 1, step: 0.1, label: 'Wall Distance' }
+    'Soft Body': folder({
+      debugPoints: { value: false },
+      kShape: { value: 300, min: 0, max: 1000, step: 1 },
+      pressureK: { value: 80, min: 0, max: 200, step: 1 },
+      kSpring: { value: 40, min: 0, max: 100, step: 1 },
+      damping: { value: 2, min: 0, max: 10, step: 0.1 },
+      wallK: { value: 300, min: 0, max: 500, step: 10 },
+      wallDamp: { value: 5, min: 0, max: 20, step: 0.5 },
+      gravityY: { value: -5, min: -20, max: 0, step: 0.5 },
+      radius: { value: 0.2, min: 0.05, max: 0.5, step: 0.01 },
+      numPoints: { value: 64, min: 16, max: 256, step: 8 },
+      wallDistance: { value: 0.9, min: 0, max: 1, step: 0.1, label: 'Wall Distance' }
+    })
   })
 }
 
@@ -209,11 +211,11 @@ const useSimulationUpdate = (cfg, gpu, posVar, restPos, buf, setCenter, instRef,
   useFrame((_, dt) => {
 
     if (drag.current.active) {
-      posVar.material.uniforms.kDrag.value   = 20.0;          // much stiffer
+      posVar.material.uniforms.kDrag.value = 20.0;          // much stiffer
       posVar.material.uniforms.dragPos.value.copy(drag.current.pos);
       posVar.material.uniforms.gravity.value.set(0, 0);         // no gravity while dragging
     } else {
-      posVar.material.uniforms.kDrag.value   = 0.0;
+      posVar.material.uniforms.kDrag.value = 0.0;
       posVar.material.uniforms.gravity.value.set(0, cfg.gravityY);
     }
 
@@ -293,7 +295,7 @@ const FullScreenPickup = ({ onDown, onMove, onUp }) => {
     >
       {/* 視口寬高對應一面平面 */}
       <planeGeometry args={[viewport.width, viewport.height]} />
-      <meshBasicMaterial transparent opacity={0}/>
+      <meshBasicMaterial transparent opacity={0} />
     </mesh>
   )
 }
@@ -311,23 +313,23 @@ export default function SoftBody() {
 
   const drag = useRef({
     active: false,
-    pos   : new THREE.Vector2()
+    pos: new THREE.Vector2()
   })
 
   const toSim = (x, y) => {
     return new THREE.Vector2(
-      (x / size.width)  * 2 - 1,
-     -(y / size.height) * 2 + 1
+      (x / size.width) * 2 - 1,
+      -(y / size.height) * 2 + 1
     )
   }
 
   const onPointerDown = e => {
     drag.current.active = true
-    drag.current.pos.copy( toSim(e.clientX, e.clientY) )
+    drag.current.pos.copy(toSim(e.clientX, e.clientY))
   }
   const onPointerMove = e => {
     if (!drag.current.active) return
-    drag.current.pos.copy( toSim(e.clientX, e.clientY) )
+    drag.current.pos.copy(toSim(e.clientX, e.clientY))
   }
   const onPointerUp = () => (drag.current.active = false)
 
@@ -354,8 +356,6 @@ export default function SoftBody() {
           posTex={gpu.getCurrentRenderTarget(posVar).texture}
           center={center}
           pointCount={cfg.numPoints}
-          color="#ff4040"
-          opacity={0.85}
         />
       )}
     </group>
