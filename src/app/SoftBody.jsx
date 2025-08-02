@@ -14,7 +14,8 @@ const genRest = (n, r) => [...Array(n)].map((_, i) => {
 // ---------- Custom Hook: Soft Body Configuration ----------
 const useSoftBodyConfig = () => {
   return useControls({
-    kShape: { value: 60, min: 0, max: 1000, step: 1 },
+    debugPoints: { value: true },
+    kShape: { value: 300, min: 0, max: 1000, step: 1 },
     pressureK: { value: 80, min: 0, max: 200, step: 1 },
     kSpring: { value: 40, min: 0, max: 100, step: 1 },
     damping: { value: 2, min: 0, max: 10, step: 0.1 },
@@ -22,7 +23,8 @@ const useSoftBodyConfig = () => {
     wallDamp: { value: 5, min: 0, max: 20, step: 0.5 },
     gravityY: { value: -5, min: -20, max: 0, step: 0.5 },
     radius: { value: 0.2, min: 0.05, max: 0.5, step: 0.01 },
-    numPoints: { value: 32, min: 16, max: 64, step: 8 }
+    numPoints: { value: 64, min: 16, max: 64, step: 8 },
+    wallDistance: { value: 0.9, min: 0, max: 1, step: 0.1, label: 'Wall Distance' }
   })
 }
 
@@ -51,6 +53,7 @@ const useGPUComputation = (cfg, restPos) => {
       uniform float  areaRest, kPressure;
       uniform vec2   gravity;
       uniform float  wallK, wallDamp;
+      uniform float  wallDistance;
       uniform vec2   rot;        // cosθ, sinθ
       uniform vec2   trans;      // translation
       uniform float  kShape;
@@ -68,26 +71,26 @@ const useGPUComputation = (cfg, restPos) => {
       vec2 wallForce (vec2 pos, vec2 vel) {
         vec2 f = vec2(0.);
         // right
-        if (pos.x > 1.) {
-          float p = pos.x - 1.;
+        if (pos.x > wallDistance) {
+          float p = pos.x - wallDistance;
           vec2  n = vec2(1.,0.);
           f += -wallK * p * n - wallDamp * dot(vel,n) * n;
         }
         // left
-        else if (pos.x < -1.) {
-          float p = -1. - pos.x;
+        else if (pos.x < -wallDistance) {
+          float p = -wallDistance - pos.x;
           vec2  n = vec2(-1.,0.);
           f += -wallK * p * n - wallDamp * dot(vel,n) * n;
         }
         // top
-        if (pos.y > 1.) {
-          float p = pos.y - 1.;
+        if (pos.y > wallDistance) {
+          float p = pos.y - wallDistance;
           vec2  n = vec2(0.,1.);
           f += -wallK * p * n - wallDamp * dot(vel,n) * n;
         }
         // bottom
-        else if (pos.y < -1.) {
-          float p = -1. - pos.y;
+        else if (pos.y < -wallDistance) {
+          float p = -wallDistance - pos.y;
           vec2  n = vec2(0.,-1.);
           f += -wallK * p * n - wallDamp * dot(vel,n) * n;
         }
@@ -162,6 +165,7 @@ const useGPUComputation = (cfg, restPos) => {
       gravity: { value: new THREE.Vector2(0, cfg.gravityY) },
       wallK: { value: cfg.wallK },
       wallDamp: { value: cfg.wallDamp },
+      wallDistance: { value: cfg.wallDistance },
       rot: { value: new THREE.Vector2(1, 0) }, // cos, sin
       trans: { value: new THREE.Vector2() },
       kShape: { value: cfg.kShape }
@@ -203,6 +207,7 @@ const useSimulationUpdate = (cfg, gpu, posVar, restPos, buf, setCenter, instRef,
     posVar.material.uniforms.damping.value = cfg.damping
     posVar.material.uniforms.wallK.value = cfg.wallK
     posVar.material.uniforms.wallDamp.value = cfg.wallDamp
+    posVar.material.uniforms.wallDistance.value = cfg.wallDistance
     posVar.material.uniforms.gravity.value = new THREE.Vector2(0, cfg.gravityY)
     posVar.material.uniforms.restLen.value = (2 * Math.PI * cfg.radius) / cfg.numPoints
     posVar.material.uniforms.areaRest.value = Math.PI * cfg.radius * cfg.radius
@@ -242,16 +247,19 @@ const useSimulationUpdate = (cfg, gpu, posVar, restPos, buf, setCenter, instRef,
    
     const s = Math.min(w2, h2)
   
-    for (let i = 0; i < cfg.numPoints; i++) {
-      dummy.position.set(
-        buf[4*i] * s,   // 同一倍率 s
-        buf[4*i + 1] * s,
-        0
-      )
-      dummy.updateMatrix()
-      instRef.current.setMatrixAt(i, dummy.matrix)
+    // Only update instanced mesh if debug points are enabled
+    if (instRef.current) {
+      for (let i = 0; i < cfg.numPoints; i++) {
+        dummy.position.set(
+          buf[4*i] * s,   // 同一倍率 s
+          buf[4*i + 1] * s,
+          0
+        )
+        dummy.updateMatrix()
+        instRef.current.setMatrixAt(i, dummy.matrix)
+      }
+      instRef.current.instanceMatrix.needsUpdate = true
     }
-    instRef.current.instanceMatrix.needsUpdate = true
   })
 }
 
@@ -268,10 +276,12 @@ export default function SoftBody() {
 
   return (
     <>
-      <instancedMesh ref={instRef} args={[null, null, cfg.numPoints]}>
-        <circleGeometry args={[0.01, 16]} />
-        <meshBasicMaterial color="#ff4040" />
-      </instancedMesh>
+      {cfg.debugPoints && (
+        <instancedMesh ref={instRef} args={[null, null, cfg.numPoints]}>
+          <circleGeometry args={[0.01, 16]} />
+          <meshBasicMaterial color="#ff4040" />
+        </instancedMesh>
+      )}
 
       {gpu.getCurrentRenderTarget(posVar).texture && (
         <SoftBodyRender
