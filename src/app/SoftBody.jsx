@@ -31,7 +31,7 @@ const useSoftBodyConfig = () => {
 // ---------- Custom Hook: GPU Computation Renderer ----------
 const useGPUComputation = (cfg, restPos) => {
   const { gl } = useThree()
-  
+
   return useMemo(() => {
     // -- 1. create GPUCompute instance & seed texture --
     const gpu = new GPUComputationRenderer(cfg.numPoints, 1, gl)
@@ -57,6 +57,9 @@ const useGPUComputation = (cfg, restPos) => {
       uniform vec2   rot;        // cosθ, sinθ
       uniform vec2   trans;      // translation
       uniform float  kShape;
+
+      uniform vec2  dragPos;     // 
+      uniform float kDrag;       // 
 
       const int   I_N = ${cfg.numPoints};
       const float F_N = float(${cfg.numPoints});
@@ -142,6 +145,9 @@ const useGPUComputation = (cfg, restPos) => {
         ) + trans;
         f += kShape * (goal - pos);
 
+
+        f += kDrag * (dragPos - trans);
+
         // semi-implicit Euler
         vel += f * dt;
         vel *= exp(-damping * dt);
@@ -168,7 +174,9 @@ const useGPUComputation = (cfg, restPos) => {
       wallDistance: { value: cfg.wallDistance },
       rot: { value: new THREE.Vector2(1, 0) }, // cos, sin
       trans: { value: new THREE.Vector2() },
-      kShape: { value: cfg.kShape }
+      kShape: { value: cfg.kShape },
+      dragPos: { value: new THREE.Vector2() },
+      kDrag: { value: 0.0 }
     })
 
     // -- 5. compile & return --
@@ -182,7 +190,7 @@ const useGPUComputation = (cfg, restPos) => {
 const useSimulationState = (cfg) => {
   const [center, setCenter] = useState([0, 0])
   const buf = useMemo(() => new Float32Array(cfg.numPoints * 4), [cfg.numPoints])
-  
+
   return { center, setCenter, buf }
 }
 
@@ -190,15 +198,25 @@ const useSimulationState = (cfg) => {
 const useInstancedMesh = (cfg) => {
   const instRef = useRef()
   const dummy = useMemo(() => new THREE.Object3D(), [])
-  
+
   return { instRef, dummy }
 }
 
 // ---------- Custom Hook: Simulation Update ----------
-const useSimulationUpdate = (cfg, gpu, posVar, restPos, buf, setCenter, instRef, dummy) => {
+const useSimulationUpdate = (cfg, gpu, posVar, restPos, buf, setCenter, instRef, dummy, drag) => {
   const { gl, viewport } = useThree()
-  
+
   useFrame((_, dt) => {
+
+    if (drag.current.active) {
+      posVar.material.uniforms.kDrag.value   = 20.0;          // much stiffer
+      posVar.material.uniforms.dragPos.value.copy(drag.current.pos);
+      posVar.material.uniforms.gravity.value.set(0, 0);         // no gravity while dragging
+    } else {
+      posVar.material.uniforms.kDrag.value   = 0.0;
+      posVar.material.uniforms.gravity.value.set(0, cfg.gravityY);
+    }
+
     // 1. run GPU simulation
     posVar.material.uniforms.dt.value = dt
     posVar.material.uniforms.kPressure.value = cfg.pressureK
@@ -208,7 +226,7 @@ const useSimulationUpdate = (cfg, gpu, posVar, restPos, buf, setCenter, instRef,
     posVar.material.uniforms.wallK.value = cfg.wallK
     posVar.material.uniforms.wallDamp.value = cfg.wallDamp
     posVar.material.uniforms.wallDistance.value = cfg.wallDistance
-    posVar.material.uniforms.gravity.value = new THREE.Vector2(0, cfg.gravityY)
+    // posVar.material.uniforms.gravity.value = new THREE.Vector2(0, cfg.gravityY)
     posVar.material.uniforms.restLen.value = (2 * Math.PI * cfg.radius) / cfg.numPoints
     posVar.material.uniforms.areaRest.value = Math.PI * cfg.radius * cfg.radius
     gpu.compute()
@@ -219,11 +237,11 @@ const useSimulationUpdate = (cfg, gpu, posVar, restPos, buf, setCenter, instRef,
 
     // 3. compute centroid & covariance (for shape matching)
     let cx = 0, cy = 0
-    for (let i = 0; i < cfg.numPoints; i++) { 
-      cx += buf[4 * i]; 
-      cy += buf[4 * i + 1] 
+    for (let i = 0; i < cfg.numPoints; i++) {
+      cx += buf[4 * i];
+      cy += buf[4 * i + 1]
     }
-    cx /= cfg.numPoints; 
+    cx /= cfg.numPoints;
     cy /= cfg.numPoints
 
     setCenter([cx, cy])
@@ -241,18 +259,18 @@ const useSimulationUpdate = (cfg, gpu, posVar, restPos, buf, setCenter, instRef,
 
     posVar.material.uniforms.rot.value.set(cos, sin)
     posVar.material.uniforms.trans.value.set(cx, cy) // rest centroid is (0,0)
-    
+
     const w2 = viewport.width * 0.5  // world half-width
     const h2 = viewport.height * 0.5  // world half-height
-   
+
     const s = Math.min(w2, h2)
-  
+
     // Only update instanced mesh if debug points are enabled
     if (instRef.current) {
       for (let i = 0; i < cfg.numPoints; i++) {
         dummy.position.set(
-          buf[4*i] * s,   // 同一倍率 s
-          buf[4*i + 1] * s,
+          buf[4 * i] * s,   // 同一倍率 s
+          buf[4 * i + 1] * s,
           0
         )
         dummy.updateMatrix()
@@ -263,19 +281,67 @@ const useSimulationUpdate = (cfg, gpu, posVar, restPos, buf, setCenter, instRef,
   })
 }
 
+const FullScreenPickup = ({ onDown, onMove, onUp }) => {
+  const { viewport } = useThree()
+  return (
+    <mesh
+      onPointerDown={onDown}
+      onPointerMove={onMove}
+      onPointerUp={onUp}
+      position={[0, 0, 0.01]}           // 放在鏡頭前一點點
+      visible={false}                   // 不影響畫面
+    >
+      {/* 視口寬高對應一面平面 */}
+      <planeGeometry args={[viewport.width, viewport.height]} />
+      <meshBasicMaterial transparent opacity={0}/>
+    </mesh>
+  )
+}
+
 // ---------- Main Component ----------
 export default function SoftBody() {
   const cfg = useSoftBodyConfig()
   const restPos = useMemo(() => genRest(cfg.numPoints, cfg.radius), [cfg.numPoints, cfg.radius])
-  
+
   const { gpu, posVar } = useGPUComputation(cfg, restPos)
   const { center, setCenter, buf } = useSimulationState(cfg)
   const { instRef, dummy } = useInstancedMesh(cfg)
-  
-  useSimulationUpdate(cfg, gpu, posVar, restPos, buf, setCenter, instRef, dummy)
+  const { size } = useThree();              // or useThree()
+
+
+  const drag = useRef({
+    active: false,
+    pos   : new THREE.Vector2()
+  })
+
+  const toSim = (x, y) => {
+    return new THREE.Vector2(
+      (x / size.width)  * 2 - 1,
+     -(y / size.height) * 2 + 1
+    )
+  }
+
+  const onPointerDown = e => {
+    drag.current.active = true
+    drag.current.pos.copy( toSim(e.clientX, e.clientY) )
+  }
+  const onPointerMove = e => {
+    if (!drag.current.active) return
+    drag.current.pos.copy( toSim(e.clientX, e.clientY) )
+  }
+  const onPointerUp = () => (drag.current.active = false)
+
+  useSimulationUpdate(cfg, gpu, posVar, restPos, buf, setCenter, instRef, dummy, drag)
 
   return (
-    <>
+    <group
+    >
+      <FullScreenPickup
+        onDown={onPointerDown}
+        onMove={onPointerMove}
+        onUp={onPointerUp}
+      />
+
       {cfg.debugPoints && (
         <instancedMesh ref={instRef} args={[null, null, cfg.numPoints]}>
           <circleGeometry args={[0.01, 16]} />
@@ -290,8 +356,8 @@ export default function SoftBody() {
           pointCount={cfg.numPoints}
           color="#ff4040"
           opacity={0.85}
-        />  
+        />
       )}
-    </>
+    </group>
   )
 }
