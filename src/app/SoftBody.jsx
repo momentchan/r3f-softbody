@@ -1,11 +1,9 @@
 import * as THREE from 'three'
 import { useFrame, useThree } from '@react-three/fiber'
 import { GPUComputationRenderer } from 'three/examples/jsm/Addons.js'
-import { useMemo, useRef } from 'react'
+import { useMemo, useRef, useState } from 'react'
 import { useControls } from 'leva'
-
-// ---------- Simulation constants ----------
-const GRAVITY_Y   = -5               // default gravity Y value
+import SoftBodyRender from './SoftBodyRender'
 
 // ---------- Helper: generate rest positions on a circle ----------
 const genRest = (n, r) => [...Array(n)].map((_, i) => {
@@ -13,47 +11,32 @@ const genRest = (n, r) => [...Array(n)].map((_, i) => {
   return [r * Math.cos(a), r * Math.sin(a)]
 })
 
-export default function SoftBody () {
-
-  const { gl, viewport } = useThree()
-  const { 
-    kShape, 
-    pressureK, 
-    kSpring, 
-    damping, 
-    wallK, 
-    wallDamp, 
-    gravityY,
-    radius,
-    numPoints
-  } = useControls({
-    kShape   : { value: 60, min: 0, max: 200, step: 1 },
+// ---------- Custom Hook: Soft Body Configuration ----------
+const useSoftBodyConfig = () => {
+  return useControls({
+    kShape: { value: 60, min: 0, max: 1000, step: 1 },
     pressureK: { value: 80, min: 0, max: 200, step: 1 },
-    kSpring  : { value: 40, min: 0, max: 100, step: 1 },
-    damping  : { value: 2, min: 0, max: 10, step: 0.1 },
-    wallK    : { value: 300, min: 0, max: 500, step: 10 },
-    wallDamp : { value: 5, min: 0, max: 20, step: 0.5 },
-    gravityY : { value: GRAVITY_Y, min: -20, max: 0, step: 0.5 },
-    radius   : { value: 0.2, min: 0.05, max: 0.5, step: 0.01 },
+    kSpring: { value: 40, min: 0, max: 100, step: 1 },
+    damping: { value: 2, min: 0, max: 10, step: 0.1 },
+    wallK: { value: 300, min: 0, max: 500, step: 10 },
+    wallDamp: { value: 5, min: 0, max: 20, step: 0.5 },
+    gravityY: { value: -5, min: -20, max: 0, step: 0.5 },
+    radius: { value: 0.2, min: 0.05, max: 0.5, step: 0.01 },
     numPoints: { value: 32, min: 16, max: 64, step: 8 }
   })
-  const restPos          = useMemo(() => genRest(numPoints, radius), [numPoints, radius])
+}
 
-  /* ---------- GPUComputationRenderer init (reactive) ---------- */
-  const { gpu, posVar } = useMemo(() => {
-
+// ---------- Custom Hook: GPU Computation Renderer ----------
+const useGPUComputation = (cfg, restPos) => {
+  const { gl } = useThree()
+  
+  return useMemo(() => {
     // -- 1. create GPUCompute instance & seed texture --
-    const gpu = new GPUComputationRenderer(numPoints, 1, gl)
+    const gpu = new GPUComputationRenderer(cfg.numPoints, 1, gl)
     const tex = gpu.createTexture()
-    for (let i = 0; i < numPoints; i++) {
-      const a = (i / numPoints) * 2 * Math.PI
-      tex.image.data.set([
-        radius * Math.cos(a),        // x
-        radius * Math.sin(a),        // y
-        0,                           // vx
-        0                            // vy
-      ], i * 4)
-    }
+    tex.image.data.set(
+      restPos.flatMap(([x, y]) => [x, y, 0, 0])
+    )
 
     // -- 2. embed rest positions as GLSL constant array string --
     const restGLSL = restPos
@@ -72,8 +55,8 @@ export default function SoftBody () {
       uniform vec2   trans;      // translation
       uniform float  kShape;
 
-      const int   I_N = ${numPoints};
-      const float F_N = float(${numPoints});
+      const int   I_N = ${cfg.numPoints};
+      const float F_N = float(${cfg.numPoints});
       const vec2  qRest[I_N] = vec2[](${restGLSL});
 
       // ------- helpers -------
@@ -170,82 +153,135 @@ export default function SoftBody () {
     gpu.setVariableDependencies(posVar, [posVar])
 
     Object.assign(posVar.material.uniforms, {
-      dt         : { value: 0 },
-      kSpring    : { value: kSpring },
-      damping    : { value: damping },
-      restLen    : { value: (2*Math.PI*radius)/numPoints },
-      areaRest   : { value: Math.PI * radius * radius },
-      kPressure  : { value: pressureK },
-      gravity    : { value: new THREE.Vector2(0, gravityY) },
-      wallK      : { value: wallK },
-      wallDamp   : { value: wallDamp },
-      rot        : { value: new THREE.Vector2(1,0) }, // cos, sin
-      trans      : { value: new THREE.Vector2() },
-      kShape     : { value: kShape }
+      dt: { value: 0 },
+      kSpring: { value: cfg.kSpring },
+      damping: { value: cfg.damping },
+      restLen: { value: (2 * Math.PI * cfg.radius) / cfg.numPoints },
+      areaRest: { value: Math.PI * cfg.radius * cfg.radius },
+      kPressure: { value: cfg.pressureK },
+      gravity: { value: new THREE.Vector2(0, cfg.gravityY) },
+      wallK: { value: cfg.wallK },
+      wallDamp: { value: cfg.wallDamp },
+      rot: { value: new THREE.Vector2(1, 0) }, // cos, sin
+      trans: { value: new THREE.Vector2() },
+      kShape: { value: cfg.kShape }
     })
 
     // -- 5. compile & return --
     const err = gpu.init()
     if (err) console.error(err)
     return { gpu, posVar }
-  }, [gl, restPos, numPoints, radius])
+  }, [gl, restPos, cfg.numPoints, cfg.radius])
+}
 
-  /* ---------- instanced circles ---------- */
+// ---------- Custom Hook: Simulation State ----------
+const useSimulationState = (cfg) => {
+  const [center, setCenter] = useState([0, 0])
+  const buf = useMemo(() => new Float32Array(cfg.numPoints * 4), [cfg.numPoints])
+  
+  return { center, setCenter, buf }
+}
+
+// ---------- Custom Hook: Instanced Mesh ----------
+const useInstancedMesh = (cfg) => {
   const instRef = useRef()
-  const dummy   = useMemo(() => new THREE.Object3D(), [])
-  const buf     = useMemo(() => new Float32Array(numPoints * 4), [numPoints])
+  const dummy = useMemo(() => new THREE.Object3D(), [])
+  
+  return { instRef, dummy }
+}
 
-  /* ---------- per-frame update ---------- */
+// ---------- Custom Hook: Simulation Update ----------
+const useSimulationUpdate = (cfg, gpu, posVar, restPos, buf, setCenter, instRef, dummy) => {
+  const { gl, viewport } = useThree()
+  
   useFrame((_, dt) => {
     // 1. run GPU simulation
-    posVar.material.uniforms.dt.value       = dt
-    posVar.material.uniforms.kPressure.value= pressureK
-    posVar.material.uniforms.kShape.value   = kShape
-    posVar.material.uniforms.kSpring.value  = kSpring
-    posVar.material.uniforms.damping.value  = damping
-    posVar.material.uniforms.wallK.value    = wallK
-    posVar.material.uniforms.wallDamp.value = wallDamp
-    posVar.material.uniforms.gravity.value  = new THREE.Vector2(0, gravityY)
-    posVar.material.uniforms.restLen.value  = (2*Math.PI*radius)/numPoints
-    posVar.material.uniforms.areaRest.value = Math.PI * radius * radius
+    posVar.material.uniforms.dt.value = dt
+    posVar.material.uniforms.kPressure.value = cfg.pressureK
+    posVar.material.uniforms.kShape.value = cfg.kShape
+    posVar.material.uniforms.kSpring.value = cfg.kSpring
+    posVar.material.uniforms.damping.value = cfg.damping
+    posVar.material.uniforms.wallK.value = cfg.wallK
+    posVar.material.uniforms.wallDamp.value = cfg.wallDamp
+    posVar.material.uniforms.gravity.value = new THREE.Vector2(0, cfg.gravityY)
+    posVar.material.uniforms.restLen.value = (2 * Math.PI * cfg.radius) / cfg.numPoints
+    posVar.material.uniforms.areaRest.value = Math.PI * cfg.radius * cfg.radius
     gpu.compute()
 
-    // 2. read positions back (numPoints → negligible)
+    // 2. read positions back
     const rt = gpu.getCurrentRenderTarget(posVar)
-    gl.readRenderTargetPixels(rt, 0, 0, numPoints, 1, buf)
+    gl.readRenderTargetPixels(rt, 0, 0, cfg.numPoints, 1, buf)
 
     // 3. compute centroid & covariance (for shape matching)
-    let cx=0, cy=0
-    for (let i=0;i<numPoints;i++){ cx+=buf[4*i]; cy+=buf[4*i+1] }
-    cx/=numPoints; cy/=numPoints
-    let a=0,b=0
-    for (let i=0;i<numPoints;i++){
-      const px = buf[4*i]   - cx
-      const py = buf[4*i+1] - cy
-      const q  = restPos[i]
-      a += px*q[0] + py*q[1]
-      b += py*q[0] - px*q[1]
+    let cx = 0, cy = 0
+    for (let i = 0; i < cfg.numPoints; i++) { 
+      cx += buf[4 * i]; 
+      cy += buf[4 * i + 1] 
     }
-    const len = Math.hypot(a,b) || 1e-6
-    const cos = a/len, sin = b/len
+    cx /= cfg.numPoints; 
+    cy /= cfg.numPoints
+
+    setCenter([cx, cy])
+
+    let a = 0, b = 0
+    for (let i = 0; i < cfg.numPoints; i++) {
+      const px = buf[4 * i] - cx
+      const py = buf[4 * i + 1] - cy
+      const q = restPos[i]
+      a += px * q[0] + py * q[1]
+      b += py * q[0] - px * q[1]
+    }
+    const len = Math.hypot(a, b) || 1e-6
+    const cos = a / len, sin = b / len
 
     posVar.material.uniforms.rot.value.set(cos, sin)
     posVar.material.uniforms.trans.value.set(cx, cy) // rest centroid is (0,0)
-
-    // 4. update instanced mesh transforms
-    for (let i=0;i<numPoints;i++){
-      dummy.position.set(buf[4*i], buf[4*i+1], 0)
+    
+    const w2 = viewport.width * 0.5  // world half-width
+    const h2 = viewport.height * 0.5  // world half-height
+   
+    const s = Math.min(w2, h2)
+  
+    for (let i = 0; i < cfg.numPoints; i++) {
+      dummy.position.set(
+        buf[4*i] * s,   // 同一倍率 s
+        buf[4*i + 1] * s,
+        0
+      )
       dummy.updateMatrix()
       instRef.current.setMatrixAt(i, dummy.matrix)
     }
     instRef.current.instanceMatrix.needsUpdate = true
   })
+}
 
-  /* ---------- JSX ---------- */
+// ---------- Main Component ----------
+export default function SoftBody() {
+  const cfg = useSoftBodyConfig()
+  const restPos = useMemo(() => genRest(cfg.numPoints, cfg.radius), [cfg.numPoints, cfg.radius])
+  
+  const { gpu, posVar } = useGPUComputation(cfg, restPos)
+  const { center, setCenter, buf } = useSimulationState(cfg)
+  const { instRef, dummy } = useInstancedMesh(cfg)
+  
+  useSimulationUpdate(cfg, gpu, posVar, restPos, buf, setCenter, instRef, dummy)
+
   return (
-    <instancedMesh ref={instRef} args={[null, null, numPoints]}>
-      <circleGeometry args={[0.01, 16]} />
-      <meshBasicMaterial color="#ff4040" />
-    </instancedMesh>
+    <>
+      <instancedMesh ref={instRef} args={[null, null, cfg.numPoints]}>
+        <circleGeometry args={[0.01, 16]} />
+        <meshBasicMaterial color="#ff4040" />
+      </instancedMesh>
+
+      {gpu.getCurrentRenderTarget(posVar).texture && (
+        <SoftBodyRender
+          posTex={gpu.getCurrentRenderTarget(posVar).texture}
+          center={center}
+          pointCount={cfg.numPoints}
+          color="#ff4040"
+          opacity={0.85}
+        />  
+      )}
+    </>
   )
 }
