@@ -2,7 +2,7 @@ import * as THREE from 'three'
 import React from 'react';
 import { useFrame, useThree } from '@react-three/fiber'
 import { GPUComputationRenderer } from 'three/examples/jsm/Addons.js'
-import { useMemo, useRef, useState } from 'react'
+import { useMemo, useRef, useState, useEffect } from 'react'
 import { useControls, folder } from 'leva'
 import SoftBodyRender from './SoftBodyRender'
 
@@ -27,6 +27,7 @@ const useSoftBodyConfig = () => {
   return useControls({
     'Soft Body': folder({
       debugPoints: { value: false },
+      debugAABBs: { value: false },
       kShape: { value: 300, min: 0, max: 1000, step: 1 },
       pressureK: { value: 80, min: 0, max: 200, step: 1 },
       kSpring: { value: 40, min: 0, max: 100, step: 1 },
@@ -50,6 +51,7 @@ const useGPUComputation = (cfg) => {
     const tex = gpu.createTexture()
     const restTex = gpu.createTexture()
     const shapeTex = gpu.createTexture()
+    const bboxTex = gpu.createTexture()
 
     // Initialize texture with rest positions for all bodies
     const restPositionsList = []
@@ -74,6 +76,11 @@ const useGPUComputation = (cfg) => {
         shapeTex.image.data[base + 1] = c.y;  // center.y
         shapeTex.image.data[base + 2] = 1.0;  // cosθ = 1
         shapeTex.image.data[base + 3] = 0.0;  // sinθ = 0
+
+        bboxTex.image.data[base + 0] = 0.0;  // min.x
+        bboxTex.image.data[base + 1] = 0.0;  // min.y
+        bboxTex.image.data[base + 2] = 0.0;  // max.x
+        bboxTex.image.data[base + 3] = 0.0;  // max.y
       }
     }
 
@@ -94,7 +101,6 @@ const useGPUComputation = (cfg) => {
       uniform float kDrag;       // drag stiffness
 
       uniform sampler2D restTex;
-      uniform sampler2D shapeMatchTex;
 
       const int   I_N = ${cfg.numPoints};
       const int   B_N = ${BODY_COUNT};
@@ -120,6 +126,23 @@ const useGPUComputation = (cfg) => {
 
       float areaRest(int body) {
         return PI * radiusArr[body] * radiusArr[body];
+      }
+      vec2 interCollisionForce(vec2 pos, int body) {
+        vec2 repulse = vec2(0.0);
+        for (int otherBody = 0; otherBody < B_N; ++otherBody) {
+          if (otherBody == body) continue;
+          for (int j = 0; j < I_N; ++j) {
+            vec2 otherPos = getPos(otherBody, j).xy;
+            vec2 d = pos - otherPos;
+            float dist2 = dot(d, d);
+            float minDist = 0.02;
+            if (dist2 < minDist * minDist && dist2 > 1e-6) {
+              vec2 dir = normalize(d);
+              repulse += 0.05 * dir / sqrt(dist2 + 1e-6);
+            }
+          }
+        }
+        return repulse;
       }
 
       vec2 wallForce(vec2 pos, vec2 vel) {
@@ -176,6 +199,8 @@ const useGPUComputation = (cfg) => {
           f += -kSpring * (d - restLen(body)) * dir;
         }
 
+        // f += interCollisionForce(pos, body); 
+
         // Internal pressure (2D gas model)
         float area = 0.;
         for (int i = 0; i < I_N; ++i) {
@@ -214,7 +239,6 @@ const useGPUComputation = (cfg) => {
         gl_FragColor = vec4(pos, vel);
       }
     `
-
     const shapeShader = /* glsl */`
       uniform sampler2D restTex;
       const int I_N = ${cfg.numPoints};
@@ -255,13 +279,43 @@ const useGPUComputation = (cfg) => {
       }
     `;
 
+    const bboxShader = /* glsl */`
+    const int I_N = ${cfg.numPoints};
+    const int B_N = ${BODY_COUNT};
+  
+    vec2 uvFromIndex(int body, int idx) {
+      float u = (float(idx)  + 0.5) / float(I_N);
+      float v = (float(body) + 0.5) / float(B_N);
+      return vec2(u, v);
+    }
+  
+    
+    void main() {
+      int body = int(gl_FragCoord.y);
+  
+      vec2 minP = vec2(1e6), maxP = vec2(-1e6);
+  
+      for (int i = 0; i < I_N; ++i) {
+        vec2 p = texture2D(texturePos, uvFromIndex(body, i)).xy;
+        minP = min(minP, p);
+        maxP = max(maxP, p);
+      }
+  
+      // 寫入該 body 的整行
+      gl_FragColor = vec4(minP, maxP);
+    }
+    `;
+
+
     // Add variable and uniforms
     const posVar = gpu.addVariable('texturePos', shader, tex)
     const shapeVar = gpu.addVariable('shapeMatchTex', shapeShader, shapeTex)
+    const bboxVar = gpu.addVariable('bboxTex', bboxShader, bboxTex)
 
     // Initialize arrays for shape matching
-    gpu.setVariableDependencies(posVar, [posVar])
+    gpu.setVariableDependencies(posVar, [posVar, bboxVar, shapeVar])
     gpu.setVariableDependencies(shapeVar, [posVar])
+    gpu.setVariableDependencies(bboxVar, [posVar])
 
     Object.assign(posVar.material.uniforms, {
       dt: { value: 0 },
@@ -277,13 +331,12 @@ const useGPUComputation = (cfg) => {
       kDrag: { value: 0.0 },
       radiusArr: { value: BODIES.map(b => b.radius) },
       restTex: { value: restTex },
-      shapeMatchTex: { value: shapeTex }
     })
 
     // Compile and return
     const err = gpu.init()
     if (err) console.error(err)
-    return { gpu, posVar, shapeVar }
+    return { gpu, posVar, shapeVar, bboxVar }
   }, [gl, cfg.numPoints, cfg.radius])
 }
 
@@ -319,10 +372,55 @@ const useInstancedMeshes = (pointsPer) => {
   return { instRefs, dummy, DebugMeshes };
 };
 
+
+function DebugAABBs({ aabbs }) {
+  const ref = useRef();
+  const { viewport } = useThree();
+
+  const geometry = useMemo(() => {
+    const geom = new THREE.BufferGeometry();
+    const positions = new Float32Array(BODY_COUNT * 8 * 3); // 4邊×2點×3維
+    geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    return geom;
+  }, []);
+
+  useEffect(() => {
+    const s = Math.min(viewport.width, viewport.height) * 0.5;
+    const posAttr = geometry.attributes.position;
+    for (let i = 0; i < aabbs.length; i++) {
+      const [min, max] = aabbs[i];
+      const x0 = min[0] * s, y0 = min[1] * s;
+      const x1 = max[0] * s, y1 = max[1] * s;
+
+      const verts = [
+        [x0, y0], [x1, y0],
+        [x1, y0], [x1, y1],
+        [x1, y1], [x0, y1],
+        [x0, y1], [x0, y0],
+      ];
+
+      for (let j = 0; j < 8; j++) {
+        const idx = i * 8 * 3 + j * 3;
+        posAttr.array[idx + 0] = verts[j][0];
+        posAttr.array[idx + 1] = verts[j][1];
+        posAttr.array[idx + 2] = 0;
+      }
+    }
+    geometry.attributes.position.needsUpdate = true;
+  }, [aabbs]);
+
+  return (
+    <lineSegments ref={ref} geometry={geometry}>
+      <lineBasicMaterial color="white" linewidth={2} />
+    </lineSegments>
+  );
+}
+
 // ---------- Custom Hook: Simulation Update ----------
-const useSimulationUpdate = (cfg, gpu, posVar, shapeVar, setCenters, instRefs, dummy, drag) => {
+const useSimulationUpdate = (cfg, gpu, posVar, shapeVar, bboxVar, setCenters, instRefs, dummy, drag, setAABBs) => {
   const { gl, viewport } = useThree()
   const rowBuf = useMemo(() => new Float32Array(cfg.numPoints * 4), [cfg.numPoints])
+
 
   useFrame((_, dt) => {
     // Handle drag interaction
@@ -347,16 +445,14 @@ const useSimulationUpdate = (cfg, gpu, posVar, shapeVar, setCenters, instRefs, d
 
     // Run GPU computation
     posVar.material.uniforms.shapeMatchTex.value = gpu.getCurrentRenderTarget(shapeVar).texture
+    posVar.material.uniforms.bboxTex.value = gpu.getCurrentRenderTarget(bboxVar).texture
     gpu.compute()
 
-    // Read positions back from GPU
-    const rt = gpu.getCurrentRenderTarget(posVar)
 
-    // Process each body
+    // Update debug circles
+    const rt = gpu.getCurrentRenderTarget(posVar)
     for (let row = 0; row < BODY_COUNT; row++) {
-      // Read one row (pointsPer × 1)
       gl.readRenderTargetPixels(rt, 0, row, cfg.numPoints, 1, rowBuf);
-      // Update debug circles (optional)
       const instRef = instRefs[row];
       if (instRef?.current) {
         const s = Math.min(viewport.width, viewport.height) * 0.5;
@@ -368,6 +464,20 @@ const useSimulationUpdate = (cfg, gpu, posVar, shapeVar, setCenters, instRefs, d
         instRef.current.instanceMatrix.needsUpdate = true;
       }
     }
+
+    // Update AABBs
+    const bboxBuf = new Float32Array(BODY_COUNT * 4);
+    const bboxRT = gpu.getCurrentRenderTarget(bboxVar)
+    gl.readRenderTargetPixels(bboxRT, 0, 0, 1, BODY_COUNT, bboxBuf);
+    const newAABBs = [];
+    for (let i = 0; i < BODY_COUNT; i++) {
+      const min = [bboxBuf[i * 4 + 0], bboxBuf[i * 4 + 1]];
+      const max = [bboxBuf[i * 4 + 2], bboxBuf[i * 4 + 3]];
+      newAABBs.push([min, max]);
+    }
+    setAABBs(newAABBs);
+
+
     // Update GPU uniforms with shape matching data
     const shapeRT = gpu.getCurrentRenderTarget(shapeVar)
     const centerBuf = new Float32Array(BODY_COUNT * 4)
@@ -402,10 +512,13 @@ const FullScreenPickup = ({ onDown, onMove, onUp }) => {
 export default function SoftBody() {
   const cfg = useSoftBodyConfig()
 
-  const { gpu, posVar, shapeVar } = useGPUComputation(cfg)
+  const { gpu, posVar, shapeVar, bboxVar } = useGPUComputation(cfg)
   const { centers, setCenters } = useSimulationState()
   const { instRefs, dummy, DebugMeshes } = useInstancedMeshes(cfg.numPoints)
   const { size } = useThree();
+  const [aabbs, setAABBs] = useState(() =>
+    Array.from({ length: BODY_COUNT }, () => [[0, 0], [0, 0]])
+  );
 
   // Drag interaction state
   const drag = useRef({
@@ -426,17 +539,17 @@ export default function SoftBody() {
     drag.current.active = true
     drag.current.pos.copy(toSimSpace(e.clientX, e.clientY))
   }
-  
+
   const onPointerMove = e => {
     if (!drag.current.active) return
     drag.current.pos.copy(toSimSpace(e.clientX, e.clientY))
   }
-  
+
 
   const onPointerUp = () => (drag.current.active = false)
 
   // Run simulation updates
-  useSimulationUpdate(cfg, gpu, posVar, shapeVar, setCenters, instRefs, dummy, drag)
+  useSimulationUpdate(cfg, gpu, posVar, shapeVar, bboxVar, setCenters, instRefs, dummy, drag, setAABBs)
 
   return (
     <group>
@@ -448,6 +561,8 @@ export default function SoftBody() {
 
       {/* Debug points (optional) */}
       {cfg.debugPoints && <DebugMeshes />}
+
+      {cfg.debugAABBs && <DebugAABBs aabbs={aabbs} />}
 
       {/* Render soft bodies */}
       {BODIES.map((body, row) => (
