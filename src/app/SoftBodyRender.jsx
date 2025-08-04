@@ -1,166 +1,176 @@
-import * as THREE from 'three'
-import { useMemo, useRef } from 'react'
-import { useThree, useFrame } from '@react-three/fiber'
-import { useControls, folder } from 'leva'
+/**************************************************************************
+ *  SoftBodyRender – multi-row version
+ **************************************************************************/
+import * as THREE from 'three';
+import { useMemo, useRef } from 'react';
+import { useThree, useFrame } from '@react-three/fiber';
+import { useControls, folder } from 'leva';
 
-/* ---------- GLSL Shaders ------------------------------------------------ */
+/* ---------- GLSL ------------------------------------------------------ */
 
 const VERTEX_SHADER = /* glsl */`
-  precision highp float;
+precision highp float;
 
-  uniform sampler2D posTex;   // rim positions
-  uniform vec2      uCenter;  // centroid (x,y)
-  uniform float     scale;
+uniform sampler2D posTex;
 
-  uniform mat4 projectionMatrix;
-  uniform mat4 modelViewMatrix;
+uniform vec2  uCenter;
+uniform float scale;
 
-  attribute float   aIndex;   // < 0 → centroid, else (i+0.5)/N
-  
-  attribute vec3 position;   // 必須存在，即使你不用它
-  attribute vec2 uv;
-  varying vec2 vUv;
-  
-  void main () {
-      vec2 p = (aIndex < 0.0)
-        ? uCenter                           // centroid
-        : texture2D(posTex, vec2(aIndex, .5)).xy; // rim
-      vec2 world = p * scale;
-      gl_Position = projectionMatrix * modelViewMatrix
-                  * vec4(world, 0.0, 1.0);
-      vUv = uv;
-  }
+uniform float uBodyRow;     // 0,1,2…
+uniform float uBodyCount;   // total rows
+uniform float uPointsPer;   // vertices per body (N)
+
+uniform mat4  projectionMatrix;
+uniform mat4  modelViewMatrix;
+
+attribute float aIndex;     // local vertex index  (0..N-1)  – or -1 for center
+attribute vec2  uv;         // pre-baked static UV
+varying   vec2  vUv;
+
+/* helper: convert (row , col) → texcoord */
+vec2 texUV(float row, float col){
+    return vec2( (col + 0.5) / uPointsPer,
+                 (row + 0.5) / uBodyCount );
+}
+
+void main () {
+
+    vec2 p;
+    if (aIndex < 0.0) {
+        p = uCenter;                           // centroid vertex
+    } else {
+        float col = aIndex;                    // 0…N-1
+        vec2  posSample = texture2D(
+            posTex, texUV(uBodyRow, col)
+        ).xy;
+        p = posSample;
+    }
+
+    vUv = uv;                                  // fixed rim-UV
+
+    vec2 world = p * scale;
+    gl_Position = projectionMatrix * modelViewMatrix
+                * vec4(world, 0.0, 1.0);
+}
 `;
 
 const FRAGMENT_SHADER = /* glsl */`
-  precision highp float;
-  uniform vec3  uColor;
-  uniform float uOpacity;
-  uniform vec3  uRimColor;
-  uniform float uRimIntensity;
-  uniform float uRimWidth;
-  varying vec2 vUv;
-  
-  void main () {
-    float d = distance(vUv, vec2(0.5));          // 0 → √0.5 ≈ 0.707
-    float rim = smoothstep(0.5- uRimWidth, 0.50, d);   // 1 inside, 0 outside
-    rim = step(uRimWidth, d);
-    rim = 1.0 - rim;
-    gl_FragColor = vec4(uColor, uOpacity * rim);
-  }
+precision highp float;
+
+uniform vec3  uColor;
+uniform float uOpacity;
+uniform float uRimWidth;      // 0–0.5
+uniform float uRimIntensity;  // >1 for glow
+
+varying vec2 vUv;
+
+void main () {
+    float d   = distance(vUv, vec2(0.5));
+    float rim = smoothstep(0.5 - uRimWidth, 0.5, d);   // 0 center →1 edge
+    vec3  col = mix(uColor, uColor * uRimIntensity, rim);
+    gl_FragColor = vec4(col, uOpacity * rim);
+}
 `;
 
-/* ---------- Custom Hook: Triangle Fan Geometry ---------- */
-const useTriangleFanGeometry = (pointCount) => {
-    return useMemo(() => {
-      const vCount = pointCount + 1;                 // +1 for centroid
-      const positions = new Float32Array(vCount * 3); // dummy
-      const aIndex = new Float32Array(vCount);
-      const uvs = new Float32Array(vCount * 2);       // NEW
-      const indexArr = [];
-  
-      // Center (vertex 0)
-      aIndex[0] = -1.0;
-      uvs[0] = 0.5;
-      uvs[1] = 0.5;
-  
-      // Rim vertices
-      for (let i = 1; i <= pointCount; i++) {
-        const angle = ((i - 1) / pointCount) * Math.PI * 2;
-        const x = Math.cos(angle);
-        const y = Math.sin(angle);
-  
-        aIndex[i] = (i - 0.5) / pointCount;
-        uvs[i * 2 + 0] = x * 0.5 + 0.5;  // map from –1~1 → 0~1
-        uvs[i * 2 + 1] = y * 0.5 + 0.5;
-  
-        indexArr.push(0, i, (i % pointCount) + 1);
-      }
-  
-      const geo = new THREE.BufferGeometry();
-      geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-      geo.setAttribute('aIndex', new THREE.BufferAttribute(aIndex, 1));
-      geo.setAttribute('uv', new THREE.BufferAttribute(uvs, 2)); // NEW
-      geo.setIndex(indexArr);
-  
-      return geo;
-    }, [pointCount]);
-  };
+/* ---------- Geometry (unchanged) -------------------------------------- */
+const useTriangleFanGeometry = (pointsPer) => useMemo(() => {
+  const vCount = pointsPer + 1;                 // +1 centre
+  const posArr = new Float32Array(vCount * 3);  // dummy
+  const aIdx   = new Float32Array(vCount);
+  const uvs    = new Float32Array(vCount * 2);
+  const idxArr = [];
 
-/* ---------- Custom Hook: Render Configuration ---------- */
-const useRenderConfig = () => {
-    return useControls({
-        'Render': folder({
-            color: { value: '#62d8ff', label: 'Color' },
-            opacity: { value: 0.85, min: 0, max: 1, step: 0.01, label: 'Opacity' },
-            visible: { value: true, label: 'Visible' },
-            rimWidth: { value: 0.1, min: 0.01, max: 0.5, step: 0.01, label: 'Rim Width' }
-        })
+  /* centre vertex */
+  aIdx[0] = -1.0;
+  uvs[0] = 0.5; uvs[1] = 0.5;
+
+  /* rim */
+  for (let i = 1; i <= pointsPer; i++) {
+    const a = (i - 1) / pointsPer * Math.PI * 2;
+    uvs[i*2]   = 0.5 + 0.5 * Math.cos(a);
+    uvs[i*2+1] = 0.5 + 0.5 * Math.sin(a);
+
+    aIdx[i] = i - 1;                        // local col index 0…N-1
+    idxArr.push(0, i, (i % pointsPer) + 1);
+  }
+
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(posArr, 3));
+  g.setAttribute('aIndex',   new THREE.BufferAttribute(aIdx, 1));
+  g.setAttribute('uv',       new THREE.BufferAttribute(uvs, 2));
+  g.setIndex(idxArr);
+  return g;
+}, [pointsPer]);
+
+/* ---------- Leva controls --------------------------------------------- */
+const useRenderConfig = () =>
+  useControls({
+    Render: folder({
+      color:      { value: '#62d8ff' },
+      opacity:    { value: 0.9,  min:0, max:1 },
+      rimWidth:   { value: 0.08, min:0.01, max:0.25 },
+      rimIntensity:{ value: 1.4, min:1, max:4 },
+      visible:    true
     })
-}
+  });
 
-/* ---------- Custom Hook: Raw Shader Material ---------- */
-const useRawShaderMaterial = (center, renderConfig) => {
-    return useMemo(() => {
-        return new THREE.RawShaderMaterial({
-            vertexShader: VERTEX_SHADER,
-            fragmentShader: FRAGMENT_SHADER,
-            // transparent: true,
-            side: THREE.DoubleSide,
-            uniforms: {
-                posTex: { value: null },
-                uCenter: { value: new THREE.Vector2(center[0], center[1]) },
-                scale: { value: 1.0 },
-                uColor: { value: new THREE.Color(renderConfig.color) },
-                uOpacity: { value: renderConfig.opacity },
-                uRimColor: { value: new THREE.Color(renderConfig.rimColor) },
-                uRimIntensity: { value: renderConfig.rimEnabled ? renderConfig.rimIntensity : 0.0 },
-                uRimWidth: { value: renderConfig.rimWidth }
-            }
-        });
-    }, []); // create once – textures & color updated per-frame below
-}
+/* ---------- Material factory ------------------------------------------ */
+const makeMaterial = (renderCfg) => new THREE.RawShaderMaterial({
+  vertexShader  : VERTEX_SHADER,
+  fragmentShader: FRAGMENT_SHADER,
+  transparent   : true,
+  side          : THREE.DoubleSide,
+  uniforms: {
+    /* filled per-frame in useFrame */
+    posTex     : { value: null },
+    uCenter    : { value: new THREE.Vector2() },
+    uBodyRow   : { value: 0 },
+    uBodyCount : { value: 1 },
+    uPointsPer : { value: 1 },
+    scale      : { value: 1 },
 
-/* ---------- Custom Hook: Material Updates ---------- */
-const useMaterialUpdates = (material, posTex, center, viewport, renderConfig) => {
-    useFrame(() => {
-        if (!material) return;
+    /* static / Leva-controlled  */
+    uColor        : { value: new THREE.Color(renderCfg.color) },
+    uOpacity      : { value: renderCfg.opacity },
+    uRimWidth     : { value: renderCfg.rimWidth },
+    uRimIntensity : { value: renderCfg.rimIntensity },
+  }
+});
 
-        // keep latest render targets
-        material.uniforms.posTex.value = posTex;
-        material.uniforms.uCenter.value = new THREE.Vector2(center[0], center[1]);
-        material.uniforms.uColor.value = new THREE.Color(renderConfig.color);
-        material.uniforms.uOpacity.value = renderConfig.opacity;
-
-        // Rim effect updates
-        material.uniforms.uRimColor.value = new THREE.Color(renderConfig.rimColor);
-        material.uniforms.uRimIntensity.value = renderConfig.rimEnabled ? renderConfig.rimIntensity : 0.0;
-        material.uniforms.uRimWidth.value = renderConfig.rimWidth;
-
-        // equal-axis scale → keeps circle from stretching
-        const s = Math.min(viewport.width, viewport.height) * 0.5;
-        material.uniforms.scale.value = s;
-    });
-}
-
-/* ---------- Main Component ------------------------------------ */
+/* ---------- Main component -------------------------------------------- */
 export default function SoftBodyRender({
-    posTex,        // THREE.Texture from GPUComputationRenderer (rim)
-    center,
-    pointCount = 32 // N – number of rim vertices
+  posTex,          // shared position texture
+  center,          // [cx,cy] current centroid
+  bodyRow,         // 0,1,2…
+  pointsPer,       // N
+  bodyCount        // M (rows)
 }) {
-    const { viewport } = useThree();
-    const matRef = useRef();
-    const renderConfig = useRenderConfig();
+  const { viewport } = useThree();
+  const renderCfg    = useRenderConfig();
+  const geom         = useTriangleFanGeometry(pointsPer);
+  const mat          = useMemo(() => makeMaterial(renderCfg), []);
 
-    const geometry = useTriangleFanGeometry(pointCount);
-    const material = useRawShaderMaterial(center, renderConfig);
+  /* per-frame updates */
+  useFrame(() => {
+    /* skip when not visible */
+    if (!renderCfg.visible) return;
 
-    useMaterialUpdates(material, posTex, center, viewport, renderConfig);
+    /* dynamic uniforms */
+    mat.uniforms.posTex.value      = posTex;
+    mat.uniforms.uCenter.value.set(center[0], center[1]);
+    mat.uniforms.uBodyRow.value    = bodyRow;
+    mat.uniforms.uBodyCount.value  = bodyCount;
+    mat.uniforms.uPointsPer.value  = pointsPer;
 
-    if (!renderConfig.visible) return null;
+    mat.uniforms.uColor.value.set(renderCfg.color);
+    mat.uniforms.uOpacity.value    = renderCfg.opacity;
+    mat.uniforms.uRimWidth.value   = renderCfg.rimWidth;
+    mat.uniforms.uRimIntensity.value = renderCfg.rimIntensity;
 
-    return (
-        <mesh geometry={geometry} material={material} ref={matRef} />
-    );
+    mat.uniforms.scale.value =
+      Math.min(viewport.width, viewport.height) * 0.5;
+  });
+
+  if (!renderCfg.visible) return null;
+  return <mesh geometry={geom} material={mat} />;
 }

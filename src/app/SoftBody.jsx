@@ -1,15 +1,26 @@
 import * as THREE from 'three'
+import React from 'react';
 import { useFrame, useThree } from '@react-three/fiber'
 import { GPUComputationRenderer } from 'three/examples/jsm/Addons.js'
 import { useMemo, useRef, useState } from 'react'
 import { useControls, folder } from 'leva'
 import SoftBodyRender from './SoftBodyRender'
 
-// ---------- Helper: generate rest positions on a circle ----------
-const genRest = (n, r) => [...Array(n)].map((_, i) => {
-  const a = (i / n) * Math.PI * 2
-  return [r * Math.cos(a), r * Math.sin(a)]
-})
+// ---------- Configuration Constants ----------
+const BODY_COUNT = 3;
+
+const BODIES = [
+  { radius: 0.22, center: new THREE.Vector2(-0.4, 0.3), color: '#ff6464' },
+  { radius: 0.18, center: new THREE.Vector2(0.2, 0.1), color: '#62d8ff' },
+  { radius: 0.25, center: new THREE.Vector2(-0.3, -0.2), color: '#98ff62' }
+];
+
+// ---------- Helper Functions ----------
+const generateRestPositions = (radius, pointsPer) =>
+  Array.from({ length: pointsPer }, (_, i) => {
+    const angle = (i / pointsPer) * Math.PI * 2
+    return [radius * Math.cos(angle), radius * Math.sin(angle)]
+  })
 
 // ---------- Custom Hook: Soft Body Configuration ----------
 const useSoftBodyConfig = () => {
@@ -31,69 +42,101 @@ const useSoftBodyConfig = () => {
 }
 
 // ---------- Custom Hook: GPU Computation Renderer ----------
-const useGPUComputation = (cfg, restPos) => {
+const useGPUComputation = (cfg) => {
   const { gl } = useThree()
 
   return useMemo(() => {
-    // -- 1. create GPUCompute instance & seed texture --
-    const gpu = new GPUComputationRenderer(cfg.numPoints, 1, gl)
+    // Create GPU computation renderer for multiple bodies
+    const gpu = new GPUComputationRenderer(cfg.numPoints, BODY_COUNT, gl)
     const tex = gpu.createTexture()
-    tex.image.data.set(
-      restPos.flatMap(([x, y]) => [x, y, 0, 0])
-    )
+    const restTex = gpu.createTexture()
+    
+    // Initialize texture with rest positions for all bodies
+    const restPositionsList = []
+    for (let row = 0; row < BODY_COUNT; row++) {
+      const restPos = generateRestPositions(BODIES[row].radius, cfg.numPoints)
+      restPositionsList.push(restPos)
+      
+      // Set texture data for this row
+      for (let i = 0; i < cfg.numPoints; i++) {
+        const [x, y] = restPos[i]
+        // Set initial position to rest position offset by the body's center
+        tex.image.data.set(
+          [x + BODIES[row].center.x, y + BODIES[row].center.y, 0, 0],
+          (row * cfg.numPoints + i) * 4
+        )
+        restTex.image.data.set([x, y, 0, 0], (row * cfg.numPoints + i) * 4)
+      }
+    }
 
-    // -- 2. embed rest positions as GLSL constant array string --
-    const restGLSL = restPos
-      .map(([x, y]) => `vec2(${x.toFixed(5)},${y.toFixed(5)})`)
-      .join(',')
+    // Store rest positions for shape matching
+    window.restList = restPositionsList
 
-    // -- 3. compute shader source --
+    // Compute shader source
     const shader = /* glsl */`
       uniform float  dt;
       uniform float  kSpring, damping;
-      uniform float  restLen;
-      uniform float  areaRest, kPressure;
+      uniform float  kPressure;
       uniform vec2   gravity;
       uniform float  wallK, wallDamp;
       uniform float  wallDistance;
-      uniform vec2   rot;        // cosθ, sinθ
-      uniform vec2   trans;      // translation
       uniform float  kShape;
 
-      uniform vec2  dragPos;     // 
-      uniform float kDrag;       // 
+      uniform vec2  dragPos;     // drag position
+      uniform float kDrag;       // drag stiffness
+
+      uniform sampler2D restTex;
 
       const int   I_N = ${cfg.numPoints};
+      const int   B_N = ${BODY_COUNT};
       const float F_N = float(${cfg.numPoints});
-      const vec2  qRest[I_N] = vec2[](${restGLSL});
+      
+      uniform float radiusArr[B_N];
+      uniform vec2 rotArr[B_N];         // rotArr[i] = (cosθi , sinθi)
+      uniform vec2 transArr[B_N];       // transArr[i] = centroid Pc_i
 
-      // ------- helpers -------
-      vec4 getPos (int idx) {
-        float u = (float(idx) + 0.5) / F_N;
-        return texture2D(texturePos, vec2(u, 0.5));
+      vec2 uvFromIndex(int body, int idx) {
+        float u = (float(idx)  + 0.5) / float(I_N);
+        float v = (float(body) + 0.5) / float(B_N);
+        return vec2(u, v);
       }
 
-      vec2 wallForce (vec2 pos, vec2 vel) {
+      vec4 getPos(int body, int idx) {
+        return texture2D(texturePos, uvFromIndex(body, idx));
+      }
+
+      const float PI = 3.14159265358979323846;
+
+      float restLen(int body) {
+        return (2.0 * PI * radiusArr[body]) / float(I_N);
+      }
+
+      float areaRest(int body) {
+        return PI * radiusArr[body] * radiusArr[body];
+      }
+
+      vec2 wallForce(vec2 pos, vec2 vel) {
         vec2 f = vec2(0.);
-        // right
+        
+        // Right wall
         if (pos.x > wallDistance) {
           float p = pos.x - wallDistance;
           vec2  n = vec2(1.,0.);
           f += -wallK * p * n - wallDamp * dot(vel,n) * n;
         }
-        // left
+        // Left wall
         else if (pos.x < -wallDistance) {
           float p = -wallDistance - pos.x;
           vec2  n = vec2(-1.,0.);
           f += -wallK * p * n - wallDamp * dot(vel,n) * n;
         }
-        // top
+        // Top wall
         if (pos.y > wallDistance) {
           float p = pos.y - wallDistance;
           vec2  n = vec2(0.,1.);
           f += -wallK * p * n - wallDamp * dot(vel,n) * n;
         }
-        // bottom
+        // Bottom wall
         else if (pos.y < -wallDistance) {
           float p = -wallDistance - pos.y;
           vec2  n = vec2(0.,-1.);
@@ -102,55 +145,60 @@ const useGPUComputation = (cfg, restPos) => {
         return f;
       }
 
-      // ------- main update -------
-      void main () {
-        int  idx = int(gl_FragCoord.x);
-        vec4 p   = getPos(idx);
+      // Main update function
+      void main() {
+        int idx = int(gl_FragCoord.x);
+        int body = int(gl_FragCoord.y);
+
+        vec2 rot = rotArr[body];    // Get rotation for this body
+        vec2 trans = transArr[body]; // Get translation for this body
+
+        vec4 p = texture2D(texturePos, uvFromIndex(body, idx));
         vec2 pos = p.xy;
         vec2 vel = p.zw;
-        vec2 f   = vec2(0.);
+        vec2 f = vec2(0.);
 
-        // spring with neighbours (structural)
+        // Spring forces with neighbors (structural)
         for (int off = -1; off <= 1; off += 2) {
-          int nIdx   = (idx + off + I_N) % I_N;
-          vec2 nPos  = getPos(nIdx).xy;
-          vec2 dir   = pos - nPos;
-          float d    = length(dir);
+          int nIdx = (idx + off + I_N) % I_N;
+          vec2 nPos = getPos(body, nIdx).xy;
+          vec2 dir = pos - nPos;
+          float d = length(dir);
           if (d > 1e-4) dir /= d;
-          f += -kSpring * (d - restLen) * dir;
+          f += -kSpring * (d - restLen(body)) * dir;
         }
 
-        // internal pressure (2-D gas model)
+        // Internal pressure (2D gas model)
         float area = 0.;
         for (int i = 0; i < I_N; ++i) {
-          vec2 p0 = getPos(i).xy;
-          vec2 p1 = getPos((i+1)%I_N).xy;
+          vec2 p0 = getPos(body, i).xy;
+          vec2 p1 = getPos(body, (i+1)%I_N).xy;
           area += p0.x*p1.y - p1.x*p0.y;
         }
         area = 0.5 * abs(area);
-        float press = kPressure * (areaRest - area) / areaRest;
-        vec2  prev  = getPos((idx + I_N-1)%I_N).xy;
-        vec2  next  = getPos((idx + 1)%I_N).xy;
-        vec2  edge  = next - prev;
-        vec2  nrm   = normalize(vec2(edge.y, -edge.x) + 1e-4);
+        float press = kPressure * (areaRest(body) - area) / areaRest(body);
+        vec2  prev = getPos(body, (idx + I_N-1)%I_N).xy;
+        vec2  next = getPos(body, (idx + 1)%I_N).xy;
+        vec2  edge = next - prev;
+        vec2  nrm = normalize(vec2(edge.y, -edge.x) + 1e-4);
         f += press * nrm / F_N;
 
-        // gravity & walls
+        // Gravity and wall forces
         f += gravity;
         f += wallForce(pos, vel);
 
-        // shape matching (goal = R·q + T)
-        vec2 q    = qRest[idx];
+        // Shape matching (goal = R·q + T)
+        vec2 q = texture2D(restTex, uvFromIndex(body, idx)).xy;
         vec2 goal = vec2(
           rot.x*q.x - rot.y*q.y,
           rot.y*q.x + rot.x*q.y
         ) + trans;
         f += kShape * (goal - pos);
 
-
+        // Drag force
         f += kDrag * (dragPos - trans);
 
-        // semi-implicit Euler
+        // Semi-implicit Euler integration
         vel += f * dt;
         vel *= exp(-damping * dt);
         pos += vel * dt;
@@ -159,67 +207,91 @@ const useGPUComputation = (cfg, restPos) => {
       }
     `
 
-    // -- 4. add variable & uniforms --
+    // Add variable and uniforms
     const posVar = gpu.addVariable('texturePos', shader, tex)
     gpu.setVariableDependencies(posVar, [posVar])
+
+    // Initialize arrays for shape matching
+    const rotSeed = new Float32Array(BODY_COUNT * 2);   // Initialize with zeros
+    const transSeed = new Float32Array(BODY_COUNT * 2);
 
     Object.assign(posVar.material.uniforms, {
       dt: { value: 0 },
       kSpring: { value: cfg.kSpring },
       damping: { value: cfg.damping },
-      restLen: { value: (2 * Math.PI * cfg.radius) / cfg.numPoints },
-      areaRest: { value: Math.PI * cfg.radius * cfg.radius },
       kPressure: { value: cfg.pressureK },
       gravity: { value: new THREE.Vector2(0, cfg.gravityY) },
       wallK: { value: cfg.wallK },
       wallDamp: { value: cfg.wallDamp },
       wallDistance: { value: cfg.wallDistance },
-      rot: { value: new THREE.Vector2(1, 0) }, // cos, sin
-      trans: { value: new THREE.Vector2() },
       kShape: { value: cfg.kShape },
       dragPos: { value: new THREE.Vector2() },
-      kDrag: { value: 0.0 }
+      kDrag: { value: 0.0 },
+      radiusArr: { value: BODIES.map(b => b.radius) },
+      restTex: { value: restTex },
+      rotArr: { value: rotSeed },
+      transArr: { value: transSeed }
     })
 
-    // -- 5. compile & return --
+    // Compile and return
     const err = gpu.init()
     if (err) console.error(err)
     return { gpu, posVar }
-  }, [gl, restPos, cfg.numPoints, cfg.radius])
+  }, [gl, cfg.numPoints, cfg.radius])
 }
 
 // ---------- Custom Hook: Simulation State ----------
-const useSimulationState = (cfg) => {
-  const [center, setCenter] = useState([0, 0])
-  const buf = useMemo(() => new Float32Array(cfg.numPoints * 4), [cfg.numPoints])
+const useSimulationState = () => {
+  const [centers, setCenters] = useState(
+    () => Array.from({ length: BODY_COUNT }, () => [0, 0])
+  );
 
-  return { center, setCenter, buf }
-}
+  return { centers, setCenters };
+};
 
-// ---------- Custom Hook: Instanced Mesh ----------
-const useInstancedMesh = (cfg) => {
-  const instRef = useRef()
-  const dummy = useMemo(() => new THREE.Object3D(), [])
+// ---------- Custom Hook: Instanced Meshes ----------
+const useInstancedMeshes = (pointsPer) => {
+  // Create refs for each body
+  const instRefs = useMemo(
+    () => Array.from({ length: BODY_COUNT }, () => React.createRef()),
+    []
+  );
 
-  return { instRef, dummy }
-}
+  // Reusable dummy Object3D for matrix updates
+  const dummy = useMemo(() => new THREE.Object3D(), []);
+
+  // JSX helper that returns an array of debug meshes
+  const DebugMeshes = () =>
+    instRefs.map((ref, row) => (
+      <instancedMesh key={row} ref={ref} args={[null, null, pointsPer]}>
+        <circleGeometry args={[0.01, 16]} />
+        <meshBasicMaterial color="#ff4040" />
+      </instancedMesh>
+    ));
+
+  return { instRefs, dummy, DebugMeshes };
+};
 
 // ---------- Custom Hook: Simulation Update ----------
-const useSimulationUpdate = (cfg, gpu, posVar, restPos, buf, setCenter, instRef, dummy, drag) => {
+const useSimulationUpdate = (cfg, gpu, posVar, setCenters, instRefs, dummy, drag) => {
   const { gl, viewport } = useThree()
 
-  useFrame((_, dt) => {
+  const rowBuf = useMemo(() => new Float32Array(cfg.numPoints * 4), [cfg.numPoints])
+  const rotData = useMemo(() => new Float32Array(BODY_COUNT * 2), [])
+  const transData = useMemo(() => new Float32Array(BODY_COUNT * 2), [])
 
+  useFrame((_, dt) => {
+    // Handle drag interaction
     if (drag.current.active) {
-      posVar.material.uniforms.kDrag.value = 20.0;          // much stiffer
+      posVar.material.uniforms.kDrag.value = 20.0;          // Much stiffer when dragging
       posVar.material.uniforms.dragPos.value.copy(drag.current.pos);
-      posVar.material.uniforms.gravity.value.set(0, 0);         // no gravity while dragging
+      posVar.material.uniforms.gravity.value.set(0, 0);     // No gravity while dragging
     } else {
       posVar.material.uniforms.kDrag.value = 0.0;
       posVar.material.uniforms.gravity.value.set(0, cfg.gravityY);
     }
 
-    // 1. run GPU simulation
+    // Update simulation uniforms
     posVar.material.uniforms.dt.value = dt
     posVar.material.uniforms.kPressure.value = cfg.pressureK
     posVar.material.uniforms.kShape.value = cfg.kShape
@@ -228,61 +300,71 @@ const useSimulationUpdate = (cfg, gpu, posVar, restPos, buf, setCenter, instRef,
     posVar.material.uniforms.wallK.value = cfg.wallK
     posVar.material.uniforms.wallDamp.value = cfg.wallDamp
     posVar.material.uniforms.wallDistance.value = cfg.wallDistance
-    // posVar.material.uniforms.gravity.value = new THREE.Vector2(0, cfg.gravityY)
-    posVar.material.uniforms.restLen.value = (2 * Math.PI * cfg.radius) / cfg.numPoints
-    posVar.material.uniforms.areaRest.value = Math.PI * cfg.radius * cfg.radius
+
+    // Run GPU computation
     gpu.compute()
 
-    // 2. read positions back
+    // Read positions back from GPU
     const rt = gpu.getCurrentRenderTarget(posVar)
-    gl.readRenderTargetPixels(rt, 0, 0, cfg.numPoints, 1, buf)
+    const centersTmp = Array(BODY_COUNT);
 
-    // 3. compute centroid & covariance (for shape matching)
-    let cx = 0, cy = 0
-    for (let i = 0; i < cfg.numPoints; i++) {
-      cx += buf[4 * i];
-      cy += buf[4 * i + 1]
-    }
-    cx /= cfg.numPoints;
-    cy /= cfg.numPoints
+    // Process each body
+    for (let row = 0; row < BODY_COUNT; row++) {
+      // Read one row (pointsPer × 1)
+      gl.readRenderTargetPixels(rt, 0, row, cfg.numPoints, 1, rowBuf);
 
-    setCenter([cx, cy])
-
-    let a = 0, b = 0
-    for (let i = 0; i < cfg.numPoints; i++) {
-      const px = buf[4 * i] - cx
-      const py = buf[4 * i + 1] - cy
-      const q = restPos[i]
-      a += px * q[0] + py * q[1]
-      b += py * q[0] - px * q[1]
-    }
-    const len = Math.hypot(a, b) || 1e-6
-    const cos = a / len, sin = b / len
-
-    posVar.material.uniforms.rot.value.set(cos, sin)
-    posVar.material.uniforms.trans.value.set(cx, cy) // rest centroid is (0,0)
-
-    const w2 = viewport.width * 0.5  // world half-width
-    const h2 = viewport.height * 0.5  // world half-height
-
-    const s = Math.min(w2, h2)
-
-    // Only update instanced mesh if debug points are enabled
-    if (instRef.current) {
-      for (let i = 0; i < cfg.numPoints; i++) {
-        dummy.position.set(
-          buf[4 * i] * s,   // 同一倍率 s
-          buf[4 * i + 1] * s,
-          0
-        )
-        dummy.updateMatrix()
-        instRef.current.setMatrixAt(i, dummy.matrix)
+      // Calculate centroid
+      let cx = 0, cy = 0;
+      for (let i = 0; i < cfg.numPoints; ++i) {
+        cx += rowBuf[i * 4];
+        cy += rowBuf[i * 4 + 1];
       }
-      instRef.current.instanceMatrix.needsUpdate = true
+      cx /= cfg.numPoints; 
+      cy /= cfg.numPoints;
+      centersTmp[row] = [cx, cy];
+
+      // Calculate covariance for shape matching
+      const rest = window.restList[row];
+      let A = 0, B = 0;
+      for (let i = 0; i < cfg.numPoints; ++i) {
+        const px = rowBuf[i * 4] - cx;
+        const py = rowBuf[i * 4 + 1] - cy;
+        const qx = rest[i][0];
+        const qy = rest[i][1];
+        A += px * qx + py * qy;
+        B += py * qx - px * qy;
+      }
+      const len = Math.hypot(A, B) || 1e-6;
+      const cos = A / len;
+      const sin = B / len;
+
+      // Pack into uniform arrays
+      rotData[row * 2] = cos;
+      rotData[row * 2 + 1] = sin;
+      transData[row * 2] = cx;
+      transData[row * 2 + 1] = cy;
+
+      // Update debug circles (optional)
+      const instRef = instRefs[row];
+      if (instRef?.current) {
+        const s = Math.min(viewport.width, viewport.height) * 0.5;
+        for (let i = 0; i < cfg.numPoints; ++i) {
+          dummy.position.set(rowBuf[i * 4] * s, rowBuf[i * 4 + 1] * s, 0);
+          dummy.updateMatrix();
+          instRef.current.setMatrixAt(i, dummy.matrix);
+        }
+        instRef.current.instanceMatrix.needsUpdate = true;
+      }
     }
+
+    // Update GPU uniforms with shape matching data
+    posVar.material.uniforms.rotArr.value = rotData;
+    posVar.material.uniforms.transArr.value = transData;
+    setCenters(centersTmp);
   })
 }
 
+// ---------- Full Screen Interaction Component ----------
 const FullScreenPickup = ({ onDown, onMove, onUp }) => {
   const { viewport } = useThree()
   return (
@@ -290,10 +372,10 @@ const FullScreenPickup = ({ onDown, onMove, onUp }) => {
       onPointerDown={onDown}
       onPointerMove={onMove}
       onPointerUp={onUp}
-      position={[0, 0, 0.01]}           // 放在鏡頭前一點點
-      visible={false}                   // 不影響畫面
+      position={[0, 0, 0.01]}           // Slightly in front of camera
+      visible={false}                   // Invisible, doesn't affect rendering
     >
-      {/* 視口寬高對應一面平面 */}
+      {/* Plane matching viewport dimensions */}
       <planeGeometry args={[viewport.width, viewport.height]} />
       <meshBasicMaterial transparent opacity={0} />
     </mesh>
@@ -303,61 +385,65 @@ const FullScreenPickup = ({ onDown, onMove, onUp }) => {
 // ---------- Main Component ----------
 export default function SoftBody() {
   const cfg = useSoftBodyConfig()
-  const restPos = useMemo(() => genRest(cfg.numPoints, cfg.radius), [cfg.numPoints, cfg.radius])
 
-  const { gpu, posVar } = useGPUComputation(cfg, restPos)
-  const { center, setCenter, buf } = useSimulationState(cfg)
-  const { instRef, dummy } = useInstancedMesh(cfg)
-  const { size } = useThree();              // or useThree()
+  const { gpu, posVar } = useGPUComputation(cfg)
+  const { centers, setCenters } = useSimulationState()
+  const { instRefs, dummy, DebugMeshes } = useInstancedMeshes(cfg.numPoints)
+  const { size } = useThree();
 
-
+  // Drag interaction state
   const drag = useRef({
     active: false,
     pos: new THREE.Vector2()
   })
 
-  const toSim = (x, y) => {
+  // Convert screen coordinates to simulation space
+  const toSimSpace = (x, y) => {
     return new THREE.Vector2(
       (x / size.width) * 2 - 1,
       -(y / size.height) * 2 + 1
     )
   }
 
+  // Pointer event handlers
   const onPointerDown = e => {
     drag.current.active = true
-    drag.current.pos.copy(toSim(e.clientX, e.clientY))
+    drag.current.pos.copy(toSimSpace(e.clientX, e.clientY))
   }
+  
   const onPointerMove = e => {
     if (!drag.current.active) return
-    drag.current.pos.copy(toSim(e.clientX, e.clientY))
+    drag.current.pos.copy(toSimSpace(e.clientX, e.clientY))
   }
+  
   const onPointerUp = () => (drag.current.active = false)
 
-  useSimulationUpdate(cfg, gpu, posVar, restPos, buf, setCenter, instRef, dummy, drag)
+  // Run simulation updates
+  useSimulationUpdate(cfg, gpu, posVar, setCenters, instRefs, dummy, drag)
 
   return (
-    <group
-    >
+    <group>
       <FullScreenPickup
         onDown={onPointerDown}
         onMove={onPointerMove}
         onUp={onPointerUp}
       />
 
-      {cfg.debugPoints && (
-        <instancedMesh ref={instRef} args={[null, null, cfg.numPoints]}>
-          <circleGeometry args={[0.01, 16]} />
-          <meshBasicMaterial color="#ff4040" />
-        </instancedMesh>
-      )}
+      {/* Debug points (optional) */}
+      {cfg.debugPoints && <DebugMeshes />}
 
-      {gpu.getCurrentRenderTarget(posVar).texture && (
+      {/* Render soft bodies */}
+      {BODIES.map((body, row) => (
         <SoftBodyRender
+          key={row}
           posTex={gpu.getCurrentRenderTarget(posVar).texture}
-          center={center}
-          pointCount={cfg.numPoints}
+          center={centers[row]}         // Centroid from state
+          bodyRow={row}
+          pointsPer={cfg.numPoints}
+          bodyCount={BODY_COUNT}
+          color={body.color}
         />
-      )}
+      ))}
     </group>
   )
 }
