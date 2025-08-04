@@ -34,7 +34,6 @@ const useSoftBodyConfig = () => {
       wallK: { value: 300, min: 0, max: 500, step: 10 },
       wallDamp: { value: 5, min: 0, max: 20, step: 0.5 },
       gravityY: { value: -5, min: -20, max: 0, step: 0.5 },
-      radius: { value: 0.2, min: 0.05, max: 0.5, step: 0.01 },
       numPoints: { value: 64, min: 16, max: 256, step: 8 },
       wallDistance: { value: 0.9, min: 0, max: 1, step: 0.1, label: 'Wall Distance' }
     })
@@ -50,22 +49,31 @@ const useGPUComputation = (cfg) => {
     const gpu = new GPUComputationRenderer(cfg.numPoints, BODY_COUNT, gl)
     const tex = gpu.createTexture()
     const restTex = gpu.createTexture()
-    
+    const shapeTex = gpu.createTexture()
+
     // Initialize texture with rest positions for all bodies
     const restPositionsList = []
     for (let row = 0; row < BODY_COUNT; row++) {
       const restPos = generateRestPositions(BODIES[row].radius, cfg.numPoints)
       restPositionsList.push(restPos)
-      
+
+      const c = BODIES[row].center
+
       // Set texture data for this row
       for (let i = 0; i < cfg.numPoints; i++) {
         const [x, y] = restPos[i]
         // Set initial position to rest position offset by the body's center
         tex.image.data.set(
-          [x + BODIES[row].center.x, y + BODIES[row].center.y, 0, 0],
+          [x + c.x, y + c.y, 0, 0],
           (row * cfg.numPoints + i) * 4
         )
         restTex.image.data.set([x, y, 0, 0], (row * cfg.numPoints + i) * 4)
+
+        const base = (row * cfg.numPoints + i) * 4;
+        shapeTex.image.data[base + 0] = c.x;  // center.x
+        shapeTex.image.data[base + 1] = c.y;  // center.y
+        shapeTex.image.data[base + 2] = 1.0;  // cosθ = 1
+        shapeTex.image.data[base + 3] = 0.0;  // sinθ = 0
       }
     }
 
@@ -86,14 +94,13 @@ const useGPUComputation = (cfg) => {
       uniform float kDrag;       // drag stiffness
 
       uniform sampler2D restTex;
+      uniform sampler2D shapeMatchTex;
 
       const int   I_N = ${cfg.numPoints};
       const int   B_N = ${BODY_COUNT};
       const float F_N = float(${cfg.numPoints});
       
       uniform float radiusArr[B_N];
-      uniform vec2 rotArr[B_N];         // rotArr[i] = (cosθi , sinθi)
-      uniform vec2 transArr[B_N];       // transArr[i] = centroid Pc_i
 
       vec2 uvFromIndex(int body, int idx) {
         float u = (float(idx)  + 0.5) / float(I_N);
@@ -150,8 +157,9 @@ const useGPUComputation = (cfg) => {
         int idx = int(gl_FragCoord.x);
         int body = int(gl_FragCoord.y);
 
-        vec2 rot = rotArr[body];    // Get rotation for this body
-        vec2 trans = transArr[body]; // Get translation for this body
+        vec4 sm   = texture2D(shapeMatchTex, vec2(0.5, (float(body)+0.5)/float(B_N)));
+        vec2 trans = sm.xy;
+        vec2 rot   = sm.zw; 
 
         vec4 p = texture2D(texturePos, uvFromIndex(body, idx));
         vec2 pos = p.xy;
@@ -207,13 +215,53 @@ const useGPUComputation = (cfg) => {
       }
     `
 
+    const shapeShader = /* glsl */`
+      uniform sampler2D restTex;
+      const int I_N = ${cfg.numPoints};
+      const int B_N = ${BODY_COUNT};
+
+      vec2 uvFromIndex(int body, int idx) {
+        float u = (float(idx)  + 0.5) / float(I_N);
+        float v = (float(body) + 0.5) / float(B_N);
+        return vec2(u, v);
+      }
+
+      void main() { 
+        int idx = int(gl_FragCoord.x);
+        int body = int(gl_FragCoord.y);
+        vec2 C = vec2(0.0);
+        float A = 0.0, B = 0.0;
+
+        // Calculate centroid
+        for (int i = 0; i < I_N; ++i) {
+          vec2 p = texture2D(texturePos, uvFromIndex(body, i)).xy;
+          C += p;
+        }
+        C /= float(I_N);
+
+        // Calculate covariance (A, B)
+        for (int i = 0; i < I_N; ++i) {
+          vec2 p = texture2D(texturePos, uvFromIndex(body, i)).xy - C;
+          vec2 q = texture2D(restTex,    uvFromIndex(body, i)).xy;
+        
+          // ----- Correct direction -----
+          A += p.x * q.x + p.y * q.y;        // dot
+          B += p.y * q.x - p.x * q.y;        // cross ★
+        }
+        float len  = max(length(vec2(A, B)), 1e-6);
+        float cosT =  A / len;
+        float sinT =  B / len;
+        gl_FragColor = vec4(C, cosT, sinT);
+      }
+    `;
+
     // Add variable and uniforms
     const posVar = gpu.addVariable('texturePos', shader, tex)
-    gpu.setVariableDependencies(posVar, [posVar])
+    const shapeVar = gpu.addVariable('shapeMatchTex', shapeShader, shapeTex)
 
     // Initialize arrays for shape matching
-    const rotSeed = new Float32Array(BODY_COUNT * 2);   // Initialize with zeros
-    const transSeed = new Float32Array(BODY_COUNT * 2);
+    gpu.setVariableDependencies(posVar, [posVar])
+    gpu.setVariableDependencies(shapeVar, [posVar])
 
     Object.assign(posVar.material.uniforms, {
       dt: { value: 0 },
@@ -229,14 +277,13 @@ const useGPUComputation = (cfg) => {
       kDrag: { value: 0.0 },
       radiusArr: { value: BODIES.map(b => b.radius) },
       restTex: { value: restTex },
-      rotArr: { value: rotSeed },
-      transArr: { value: transSeed }
+      shapeMatchTex: { value: shapeTex }
     })
 
     // Compile and return
     const err = gpu.init()
     if (err) console.error(err)
-    return { gpu, posVar }
+    return { gpu, posVar, shapeVar }
   }, [gl, cfg.numPoints, cfg.radius])
 }
 
@@ -273,12 +320,9 @@ const useInstancedMeshes = (pointsPer) => {
 };
 
 // ---------- Custom Hook: Simulation Update ----------
-const useSimulationUpdate = (cfg, gpu, posVar, setCenters, instRefs, dummy, drag) => {
+const useSimulationUpdate = (cfg, gpu, posVar, shapeVar, setCenters, instRefs, dummy, drag) => {
   const { gl, viewport } = useThree()
-
   const rowBuf = useMemo(() => new Float32Array(cfg.numPoints * 4), [cfg.numPoints])
-  const rotData = useMemo(() => new Float32Array(BODY_COUNT * 2), [])
-  const transData = useMemo(() => new Float32Array(BODY_COUNT * 2), [])
 
   useFrame((_, dt) => {
     // Handle drag interaction
@@ -302,48 +346,16 @@ const useSimulationUpdate = (cfg, gpu, posVar, setCenters, instRefs, dummy, drag
     posVar.material.uniforms.wallDistance.value = cfg.wallDistance
 
     // Run GPU computation
+    posVar.material.uniforms.shapeMatchTex.value = gpu.getCurrentRenderTarget(shapeVar).texture
     gpu.compute()
 
     // Read positions back from GPU
     const rt = gpu.getCurrentRenderTarget(posVar)
-    const centersTmp = Array(BODY_COUNT);
 
     // Process each body
     for (let row = 0; row < BODY_COUNT; row++) {
       // Read one row (pointsPer × 1)
       gl.readRenderTargetPixels(rt, 0, row, cfg.numPoints, 1, rowBuf);
-
-      // Calculate centroid
-      let cx = 0, cy = 0;
-      for (let i = 0; i < cfg.numPoints; ++i) {
-        cx += rowBuf[i * 4];
-        cy += rowBuf[i * 4 + 1];
-      }
-      cx /= cfg.numPoints; 
-      cy /= cfg.numPoints;
-      centersTmp[row] = [cx, cy];
-
-      // Calculate covariance for shape matching
-      const rest = window.restList[row];
-      let A = 0, B = 0;
-      for (let i = 0; i < cfg.numPoints; ++i) {
-        const px = rowBuf[i * 4] - cx;
-        const py = rowBuf[i * 4 + 1] - cy;
-        const qx = rest[i][0];
-        const qy = rest[i][1];
-        A += px * qx + py * qy;
-        B += py * qx - px * qy;
-      }
-      const len = Math.hypot(A, B) || 1e-6;
-      const cos = A / len;
-      const sin = B / len;
-
-      // Pack into uniform arrays
-      rotData[row * 2] = cos;
-      rotData[row * 2 + 1] = sin;
-      transData[row * 2] = cx;
-      transData[row * 2 + 1] = cy;
-
       // Update debug circles (optional)
       const instRef = instRefs[row];
       if (instRef?.current) {
@@ -356,11 +368,15 @@ const useSimulationUpdate = (cfg, gpu, posVar, setCenters, instRefs, dummy, drag
         instRef.current.instanceMatrix.needsUpdate = true;
       }
     }
-
     // Update GPU uniforms with shape matching data
-    posVar.material.uniforms.rotArr.value = rotData;
-    posVar.material.uniforms.transArr.value = transData;
-    setCenters(centersTmp);
+    const shapeRT = gpu.getCurrentRenderTarget(shapeVar)
+    const centerBuf = new Float32Array(BODY_COUNT * 4)
+    gl.readRenderTargetPixels(shapeRT, 0, 0, 1, BODY_COUNT, centerBuf)
+    const cTmp = Array(BODY_COUNT)
+    for (let r = 0; r < BODY_COUNT; r++) {
+      cTmp[r] = [centerBuf[r * 4], centerBuf[r * 4 + 1]]
+    }
+    setCenters(cTmp)
   })
 }
 
@@ -386,7 +402,7 @@ const FullScreenPickup = ({ onDown, onMove, onUp }) => {
 export default function SoftBody() {
   const cfg = useSoftBodyConfig()
 
-  const { gpu, posVar } = useGPUComputation(cfg)
+  const { gpu, posVar, shapeVar } = useGPUComputation(cfg)
   const { centers, setCenters } = useSimulationState()
   const { instRefs, dummy, DebugMeshes } = useInstancedMeshes(cfg.numPoints)
   const { size } = useThree();
@@ -416,10 +432,11 @@ export default function SoftBody() {
     drag.current.pos.copy(toSimSpace(e.clientX, e.clientY))
   }
   
+
   const onPointerUp = () => (drag.current.active = false)
 
   // Run simulation updates
-  useSimulationUpdate(cfg, gpu, posVar, setCenters, instRefs, dummy, drag)
+  useSimulationUpdate(cfg, gpu, posVar, shapeVar, setCenters, instRefs, dummy, drag)
 
   return (
     <group>
