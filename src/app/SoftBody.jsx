@@ -39,7 +39,6 @@ const useSoftBodyConfig = () => {
       wallDistance: { value: 0.9, min: 0, max: 1, step: 0.1, label: 'Wall Distance' },
       pushStrength: { value: 10, min: 0, max: 100, step: 1 },
       kDampSpring: { value: 1.0, min: 0.0, max: 10.0, step: 0.1 },
-      dragBody: { value: -1 }, 
     })
   })
 }
@@ -223,7 +222,11 @@ const useGPUComputation = (cfg) => {
         f += press * nrm / F_N;
 
         // Gravity and wall forces
-        f += gravity;
+        if (body != dragBody) {
+          f += gravity;
+        }
+
+
         f += wallForce(pos, vel);
 
         // Shape matching (goal = R·q + T)
@@ -485,7 +488,8 @@ const useSimulationUpdate = (cfg, gpu, posVar, shapeVar, bboxVar, setCenters, in
   useFrame((_, dt) => {
     // Handle drag interaction
     if (drag.current.active && drag.current.target !== -1) {
-      posVar.material.uniforms.kDrag.value = 20.0;
+      posVar.material.uniforms.kDrag.value = 200.0;
+      posVar.material.uniforms.dragPos.value.copy(drag.current.pos);
     } else {
       posVar.material.uniforms.kDrag.value = 0.0;
     }
@@ -582,7 +586,8 @@ export default function SoftBody() {
   // Drag interaction state
   const drag = useRef({
     active: false,
-    pos: new THREE.Vector2()
+    pos: new THREE.Vector2(),
+    target: -1
   })
 
   // Convert screen coordinates to simulation space
@@ -615,12 +620,15 @@ export default function SoftBody() {
   };
 
   const onPointerMove = (e) => {
-    if (!drag.current.active) return;          // 只在拖曳中才管
+    if (!drag.current.active) return; 
     drag.current.pos.copy(toSimSpace(e.clientX, e.clientY));
   };
 
 
-  const onPointerUp = () => (drag.current.target = -1)
+  const onPointerUp = () => {
+    drag.current.target = -1;
+    drag.current.active = false;
+  }
 
   // Run simulation updates
   useSimulationUpdate(cfg, gpu, posVar, shapeVar, bboxVar, setCenters, instRefs, dummy, drag, setAABBs)
