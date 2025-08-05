@@ -26,12 +26,12 @@ const generateRestPositions = (radius, pointsPer) =>
 const useSoftBodyConfig = () => {
   return useControls({
     'Soft Body': folder({
-      debugPoints: { value: true },
+      debugPoints: { value: false },
       debugAABBs: { value: false },
       kShape: { value: 300, min: 0, max: 1000, step: 1 },
       pressureK: { value: 80, min: 0, max: 200, step: 1 },
       kSpring: { value: 40, min: 0, max: 100, step: 1 },
-      damping: { value: 2, min: 0, max: 10, step: 0.1 },
+      damping: { value: 0.5, min: 0, max: 10, step: 0.1 },
       wallK: { value: 300, min: 0, max: 500, step: 10 },
       wallDamp: { value: 5, min: 0, max: 20, step: 0.5 },
       gravityY: { value: -5, min: -20, max: 0, step: 0.5 },
@@ -99,7 +99,6 @@ const useGPUComputation = (cfg) => {
       uniform float  wallK, wallDamp;
       uniform float  wallDistance;
       uniform float  kShape;
-      uniform float  pushStrength;
       uniform int   dragBody;
 
       uniform vec2  dragPos;     // drag position
@@ -392,7 +391,6 @@ const useGPUComputation = (cfg) => {
       kDrag: { value: 0.0 },
       radiusArr: { value: BODIES.map(b => b.radius) },
       restTex: { value: restTex },
-      pushStrength: { value: cfg.pushStrength },
       dragBody: { value: -1 },
     })
 
@@ -503,7 +501,6 @@ const useSimulationUpdate = (cfg, gpu, posVar, shapeVar, bboxVar, setCenters, in
     posVar.material.uniforms.wallK.value = cfg.wallK
     posVar.material.uniforms.wallDamp.value = cfg.wallDamp
     posVar.material.uniforms.wallDistance.value = cfg.wallDistance
-    posVar.material.uniforms.pushStrength.value = cfg.pushStrength
 
     // Run GPU computation
     posVar.material.uniforms.shapeMatchTex.value = gpu.getCurrentRenderTarget(shapeVar).texture
