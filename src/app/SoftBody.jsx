@@ -26,7 +26,7 @@ const generateRestPositions = (radius, pointsPer) =>
 const useSoftBodyConfig = () => {
   return useControls({
     'Soft Body': folder({
-      debugPoints: { value: false },
+      debugPoints: { value: true },
       debugAABBs: { value: false },
       kShape: { value: 300, min: 0, max: 1000, step: 1 },
       pressureK: { value: 80, min: 0, max: 200, step: 1 },
@@ -38,6 +38,8 @@ const useSoftBodyConfig = () => {
       numPoints: { value: 32, min: 16, max: 256, step: 8 },
       wallDistance: { value: 0.9, min: 0, max: 1, step: 0.1, label: 'Wall Distance' },
       pushStrength: { value: 10, min: 0, max: 100, step: 1 },
+      kDampSpring: { value: 1.0, min: 0.0, max: 10.0, step: 0.1 },
+      dragBody: { value: -1 }, 
     })
   })
 }
@@ -92,12 +94,14 @@ const useGPUComputation = (cfg) => {
     const shader = /* glsl */`
       uniform float  dt;
       uniform float  kSpring, damping;
+      uniform float  kDampSpring;
       uniform float  kPressure;
       uniform vec2   gravity;
       uniform float  wallK, wallDamp;
       uniform float  wallDistance;
       uniform float  kShape;
       uniform float  pushStrength;
+      uniform int   dragBody;
 
       uniform vec2  dragPos;     // drag position
       uniform float kDrag;       // drag stiffness
@@ -177,11 +181,29 @@ const useGPUComputation = (cfg) => {
         // Spring forces with neighbors (structural)
         for (int off = -1; off <= 1; off += 2) {
           int nIdx = (idx + off + I_N) % I_N;
-          vec2 nPos = getPos(body, nIdx).xy;
-          vec2 dir = pos - nPos;
-          float d = length(dir);
-          if (d > 1e-4) dir /= d;
-          f += -kSpring * (d - restLen(body)) * dir;
+        
+          // 取得鄰居的位置與速度
+          vec4 nTex = getPos(body, nIdx);        // 你的 getPos 回傳 vec4(pos.xy, vel.xy)
+          vec2 pb   = nTex.xy;
+          vec2 vb   = nTex.zw;
+        
+          // 當前點
+          vec2 pa = pos;
+          vec2 va = vel;
+        
+          // 向量與長度
+          vec2 ab = pb - pa;
+          float d  = length(ab);
+          vec2 dir = d > 1e-6 ? ab / d : vec2(0.0);
+        
+          float Fs = kSpring * (d - restLen(body));     // restLen(body) 已有
+        
+          float vRel = dot(dir, vb - va);               // 只取在彈簧方向上的相對速度
+          float Fd   = kDampSpring * vRel;              // ← 新 uniform
+        
+          // 合力
+          vec2 Fspring = (Fs + Fd) * dir;
+          f += Fspring;
         }
 
 
@@ -200,9 +222,6 @@ const useGPUComputation = (cfg) => {
         vec2  nrm = normalize(vec2(edge.y, -edge.x) + 1e-4);
         f += press * nrm / F_N;
 
-       
-        
-
         // Gravity and wall forces
         f += gravity;
         f += wallForce(pos, vel);
@@ -216,7 +235,9 @@ const useGPUComputation = (cfg) => {
         f += kShape * (goal - pos);
 
         // Drag force
-        f += kDrag * (dragPos - trans);
+        if (body == dragBody) {
+          f += kDrag * (dragPos - trans);
+        }
 
         // Semi-implicit Euler integration
         vel += f * dt;
@@ -356,6 +377,7 @@ const useGPUComputation = (cfg) => {
     Object.assign(posVar.material.uniforms, {
       dt: { value: 0 },
       kSpring: { value: cfg.kSpring },
+      kDampSpring: { value: cfg.kDampSpring },
       damping: { value: cfg.damping },
       kPressure: { value: cfg.pressureK },
       gravity: { value: new THREE.Vector2(0, cfg.gravityY) },
@@ -368,6 +390,7 @@ const useGPUComputation = (cfg) => {
       radiusArr: { value: BODIES.map(b => b.radius) },
       restTex: { value: restTex },
       pushStrength: { value: cfg.pushStrength },
+      dragBody: { value: -1 },
     })
 
     // Compile and return
@@ -461,13 +484,10 @@ const useSimulationUpdate = (cfg, gpu, posVar, shapeVar, bboxVar, setCenters, in
 
   useFrame((_, dt) => {
     // Handle drag interaction
-    if (drag.current.active) {
-      posVar.material.uniforms.kDrag.value = 20.0;          // Much stiffer when dragging
-      posVar.material.uniforms.dragPos.value.copy(drag.current.pos);
-      posVar.material.uniforms.gravity.value.set(0, 0);     // No gravity while dragging
+    if (drag.current.active && drag.current.target !== -1) {
+      posVar.material.uniforms.kDrag.value = 20.0;
     } else {
       posVar.material.uniforms.kDrag.value = 0.0;
-      posVar.material.uniforms.gravity.value.set(0, cfg.gravityY);
     }
 
     // Update simulation uniforms
@@ -484,6 +504,7 @@ const useSimulationUpdate = (cfg, gpu, posVar, shapeVar, bboxVar, setCenters, in
     // Run GPU computation
     posVar.material.uniforms.shapeMatchTex.value = gpu.getCurrentRenderTarget(shapeVar).texture
     posVar.material.uniforms.bboxTex.value = gpu.getCurrentRenderTarget(bboxVar).texture
+    posVar.material.uniforms.dragBody.value = drag.current.target ?? -1;
     gpu.compute()
 
 
@@ -566,25 +587,40 @@ export default function SoftBody() {
 
   // Convert screen coordinates to simulation space
   const toSimSpace = (x, y) => {
+    const s = Math.min(size.width, size.height) * 0.5;     // 與 instancing 相同
+    // 先轉到以螢幕中心為 (0,0) 的座標，再除以 s
     return new THREE.Vector2(
-      (x / size.width) * 2 - 1,
-      -(y / size.height) * 2 + 1
-    )
-  }
+      (x - size.width  * 0.5) / s,
+      -(y - size.height * 0.5) / s
+    );
+  };
 
-  // Pointer event handlers
-  const onPointerDown = e => {
-    drag.current.active = true
-    drag.current.pos.copy(toSimSpace(e.clientX, e.clientY))
-  }
+  const onPointerDown = (e) => {
+    const mouseSim = toSimSpace(e.clientX, e.clientY);
+    drag.current.active = true;
+    drag.current.pos.copy(mouseSim);
+  
+    // 判斷滑鼠落在哪個 soft-body：中心距離 < 半徑
+    drag.current.target = -1;
+    for (let row = 0; row < BODY_COUNT; row++) {
+      const c = centers[row];                 // [x, y] in sim space
+      if (!c) continue;
+      const r = BODIES[row].radius;
+      const dist2 = (mouseSim.x - c[0])**2 + (mouseSim.y - c[1])**2;
+      if (dist2 < r * r) {
+        drag.current.target = row;
+        break;
+      }
+    }
+  };
 
-  const onPointerMove = e => {
-    if (!drag.current.active) return
-    drag.current.pos.copy(toSimSpace(e.clientX, e.clientY))
-  }
+  const onPointerMove = (e) => {
+    if (!drag.current.active) return;          // 只在拖曳中才管
+    drag.current.pos.copy(toSimSpace(e.clientX, e.clientY));
+  };
 
 
-  const onPointerUp = () => (drag.current.active = false)
+  const onPointerUp = () => (drag.current.target = -1)
 
   // Run simulation updates
   useSimulationUpdate(cfg, gpu, posVar, shapeVar, bboxVar, setCenters, instRefs, dummy, drag, setAABBs)
