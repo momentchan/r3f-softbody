@@ -35,8 +35,9 @@ const useSoftBodyConfig = () => {
       wallK: { value: 300, min: 0, max: 500, step: 10 },
       wallDamp: { value: 5, min: 0, max: 20, step: 0.5 },
       gravityY: { value: -5, min: -20, max: 0, step: 0.5 },
-      numPoints: { value: 64, min: 16, max: 256, step: 8 },
-      wallDistance: { value: 0.9, min: 0, max: 1, step: 0.1, label: 'Wall Distance' }
+      numPoints: { value: 32, min: 16, max: 256, step: 8 },
+      wallDistance: { value: 0.9, min: 0, max: 1, step: 0.1, label: 'Wall Distance' },
+      pushStrength: { value: 10, min: 0, max: 100, step: 1 },
     })
   })
 }
@@ -96,6 +97,7 @@ const useGPUComputation = (cfg) => {
       uniform float  wallK, wallDamp;
       uniform float  wallDistance;
       uniform float  kShape;
+      uniform float  pushStrength;
 
       uniform vec2  dragPos;     // drag position
       uniform float kDrag;       // drag stiffness
@@ -126,23 +128,6 @@ const useGPUComputation = (cfg) => {
 
       float areaRest(int body) {
         return PI * radiusArr[body] * radiusArr[body];
-      }
-      vec2 interCollisionForce(vec2 pos, int body) {
-        vec2 repulse = vec2(0.0);
-        for (int otherBody = 0; otherBody < B_N; ++otherBody) {
-          if (otherBody == body) continue;
-          for (int j = 0; j < I_N; ++j) {
-            vec2 otherPos = getPos(otherBody, j).xy;
-            vec2 d = pos - otherPos;
-            float dist2 = dot(d, d);
-            float minDist = 0.02;
-            if (dist2 < minDist * minDist && dist2 > 1e-6) {
-              vec2 dir = normalize(d);
-              repulse += 0.05 * dir / sqrt(dist2 + 1e-6);
-            }
-          }
-        }
-        return repulse;
       }
 
       vec2 wallForce(vec2 pos, vec2 vel) {
@@ -199,7 +184,6 @@ const useGPUComputation = (cfg) => {
           f += -kSpring * (d - restLen(body)) * dir;
         }
 
-        // f += interCollisionForce(pos, body); 
 
         // Internal pressure (2D gas model)
         float area = 0.;
@@ -215,6 +199,9 @@ const useGPUComputation = (cfg) => {
         vec2  edge = next - prev;
         vec2  nrm = normalize(vec2(edge.y, -edge.x) + 1e-4);
         f += press * nrm / F_N;
+
+       
+        
 
         // Gravity and wall forces
         f += gravity;
@@ -234,7 +221,56 @@ const useGPUComputation = (cfg) => {
         // Semi-implicit Euler integration
         vel += f * dt;
         vel *= exp(-damping * dt);
-        pos += vel * dt;
+
+        // --- temporarily update pos to predict ---
+        vec2 nextPos = pos + vel * dt;
+
+        // --- collision check and correction ---
+        for (int otherBody = 0; otherBody < B_N; ++otherBody) {
+          if (otherBody == body) continue;
+
+          vec4 bbox = texture2D(bboxTex, vec2(0.5, (float(otherBody)+0.5)/float(B_N)));
+          vec2 minP = bbox.xy, maxP = bbox.zw;
+
+          if (nextPos.x < minP.x || nextPos.x > maxP.x || nextPos.y < minP.y || nextPos.y > maxP.y) continue;
+
+          int count = 0;
+          for (int i = 0; i < I_N; ++i) {
+            vec2 a = getPos(otherBody, i).xy;
+            vec2 b = getPos(otherBody, (i+1)%I_N).xy;
+            if ((a.y > nextPos.y) != (b.y > nextPos.y)) {
+              float t = (nextPos.y - a.y) / (b.y - a.y);
+              float xCross = mix(a.x, b.x, t);
+              if (nextPos.x < xCross) count++;
+            }
+          }
+
+          if (count % 2 == 1) {
+            float minDist = 1e6;
+            vec2 newPos = nextPos;
+
+            for (int i = 0; i < I_N; ++i) {
+              vec2 a = getPos(otherBody, i).xy;
+              vec2 b = getPos(otherBody, (i+1)%I_N).xy;
+              vec2 ab = b - a;
+              vec2 ap = nextPos - a;
+
+              float t = clamp(dot(ap, ab) / (dot(ab, ab) + 1e-6), 0.0, 1.0);
+              vec2 proj = a + t * ab;
+              float d = length(nextPos - proj);
+              if (d < minDist) {
+                minDist = d;
+                newPos = proj;
+              }
+            }
+
+            nextPos = mix(nextPos, newPos, 1.0);
+            vel = vec2(0.0); 
+          }
+        }
+
+        // --- final position update ---
+        pos = nextPos;
 
         gl_FragColor = vec4(pos, vel);
       }
@@ -331,6 +367,7 @@ const useGPUComputation = (cfg) => {
       kDrag: { value: 0.0 },
       radiusArr: { value: BODIES.map(b => b.radius) },
       restTex: { value: restTex },
+      pushStrength: { value: cfg.pushStrength },
     })
 
     // Compile and return
@@ -442,6 +479,7 @@ const useSimulationUpdate = (cfg, gpu, posVar, shapeVar, bboxVar, setCenters, in
     posVar.material.uniforms.wallK.value = cfg.wallK
     posVar.material.uniforms.wallDamp.value = cfg.wallDamp
     posVar.material.uniforms.wallDistance.value = cfg.wallDistance
+    posVar.material.uniforms.pushStrength.value = cfg.pushStrength
 
     // Run GPU computation
     posVar.material.uniforms.shapeMatchTex.value = gpu.getCurrentRenderTarget(shapeVar).texture
